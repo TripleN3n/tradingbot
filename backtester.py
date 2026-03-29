@@ -89,8 +89,7 @@ def add_all_indicators(df):
     df['stoch_k'], df['stoch_d'] = stochastic(df)
     df['vol_ma20'] = df['volume'].rolling(20).mean()
     df['vol_ratio'] = df['volume'] / df['vol_ma20']
-    df['obv'] = (df['volume'] * df['close'].diff().apply(
-        lambda x: 1 if x > 0 else -1)).cumsum()
+    df['obv'] = (df['volume'] * np.sign(df['close'].diff())).cumsum()
     df['obv_ema'] = ema(df['obv'], 21)
     return df.dropna()
 
