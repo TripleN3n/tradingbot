@@ -117,16 +117,18 @@ def get_market_regime_from_log():
             lines = f.readlines()
         for line in reversed(lines):
             if 'regime' in line.lower():
-                if 'bearish' in line.lower(): return 'BEARISH'
-                elif 'trending' in line.lower(): return 'TRENDING'
-                elif 'ranging' in line.lower(): return 'RANGING'
+                if 'bearish' in line.lower():
+                    return 'BEARISH'
+                elif 'trending' in line.lower():
+                    return 'TRENDING'
+                elif 'ranging' in line.lower():
+                    return 'RANGING'
         return 'UNKNOWN'
     except:
         return 'UNKNOWN'
 
 
-# ─── HEADER ──────────────────────────────────────────────────
-
+# HEADER
 col_title, col_status = st.columns([3, 1])
 with col_title:
     st.markdown("""
@@ -152,8 +154,7 @@ with col_status:
 
 st.markdown('<hr style="border:none; border-top:1px solid #1e1e2e; margin:1rem 0;">', unsafe_allow_html=True)
 
-# ─── DATA ────────────────────────────────────────────────────
-
+# DATA
 conn = get_conn()
 stats = get_performance_stats(conn)
 open_trades = get_open_trades(conn)
@@ -161,8 +162,7 @@ closed_trades = get_closed_trades(conn)
 portfolio_history = get_portfolio_history(conn)
 last_cycle = get_last_cycle_time(conn)
 
-# ─── TOP METRICS ─────────────────────────────────────────────
-
+# TOP METRICS
 c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 
 metrics = [
@@ -189,8 +189,7 @@ for col, label, value, delta, is_pos in metrics:
 
 st.markdown("")
 
-# ─── EQUITY CURVE + TRADE ACTIVITY ───────────────────────────
-
+# EQUITY CURVE + TRADE ACTIVITY
 col_eq, col_freq = st.columns([2, 1])
 
 with col_eq:
@@ -225,8 +224,10 @@ with col_freq:
         closed_trades['exit_date'] = pd.to_datetime(closed_trades['exit_time']).dt.date
         daily = closed_trades.groupby('exit_date').size().reset_index(name='count')
         fig2 = go.Figure()
-        fig2.add_trace(go.Bar(x=daily['exit_date'], y=daily['count'],
-                               marker_color='#5a5aff', marker_opacity=0.8))
+        fig2.add_trace(go.Bar(
+            x=daily['exit_date'], y=daily['count'],
+            marker_color='#5a5aff', marker_opacity=0.8
+        ))
         fig2.update_layout(
             height=220, margin=dict(l=0, r=0, t=10, b=0),
             paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
@@ -238,8 +239,7 @@ with col_freq:
     else:
         st.info("Activity chart will appear after first trades.")
 
-# ─── OPEN POSITIONS ───────────────────────────────────────────
-
+# OPEN POSITIONS
 st.markdown('<div class="section-header">Open Positions</div>', unsafe_allow_html=True)
 
 if open_trades:
@@ -267,8 +267,7 @@ else:
     </div>
     """, unsafe_allow_html=True)
 
-# ─── PERFORMANCE ANALYSIS ─────────────────────────────────────
-
+# PERFORMANCE ANALYSIS
 if not closed_trades.empty:
     st.markdown("")
     st.markdown('<div class="section-header">Performance Analysis</div>', unsafe_allow_html=True)
@@ -278,8 +277,11 @@ if not closed_trades.empty:
     with col_pnl:
         colors = ['#00d4aa' if p > 0 else '#ff4b6e' for p in closed_trades['pnl']]
         fig3 = go.Figure()
-        fig3.add_trace(go.Bar(x=list(range(1, len(closed_trades)+1)),
-                               y=closed_trades['pnl'], marker_color=colors))
+        fig3.add_trace(go.Bar(
+            x=list(range(1, len(closed_trades)+1)),
+            y=closed_trades['pnl'],
+            marker_color=colors
+        ))
         fig3.update_layout(
             title=dict(text="PnL Per Trade", font=dict(color='#6b6b8a', size=11)),
             height=220, margin=dict(l=0, r=0, t=30, b=0),
@@ -292,8 +294,16 @@ if not closed_trades.empty:
 
     with col_exit:
         exit_counts = closed_trades['exit_reason'].value_counts()
-        fig4 = px.pie(values=exit_counts.values, names=exit_counts.index, hole=0.5,
-                      color_discrete_map={'take_profit': '#00d4aa', 'stop_loss': '#ff4b6e', 'time_stop': '#ffa500'})
+        fig4 = px.pie(
+            values=exit_counts.values,
+            names=exit_counts.index,
+            hole=0.5,
+            color_discrete_map={
+                'take_profit': '#00d4aa',
+                'stop_loss': '#ff4b6e',
+                'time_stop': '#ffa500'
+            }
+        )
         fig4.update_layout(
             title=dict(text="Exit Reasons", font=dict(color='#6b6b8a', size=11)),
             height=220, margin=dict(l=0, r=0, t=30, b=0),
@@ -308,7 +318,8 @@ if not closed_trades.empty:
         token_summary = token_pnl.groupby('token')['pnl'].sum().sort_values()
         fig5 = go.Figure()
         fig5.add_trace(go.Bar(
-            x=token_summary.values, y=token_summary.index,
+            x=token_summary.values,
+            y=token_summary.index,
             orientation='h',
             marker_color=['#00d4aa' if v > 0 else '#ff4b6e' for v in token_summary.values]
         ))
@@ -329,10 +340,12 @@ if not closed_trades.empty:
         short_count = len(closed_trades[closed_trades['signal'] == 'short'])
         fig6 = go.Figure()
         fig6.add_trace(go.Bar(
-            x=['LONG', 'SHORT'], y=[long_pnl, short_pnl],
+            x=['LONG', 'SHORT'],
+            y=[long_pnl, short_pnl],
             marker_color=['#00d4aa', '#ff4b6e'],
             text=[f'{long_count} trades', f'{short_count} trades'],
-            textposition='auto', textfont=dict(color='white', size=9)
+            textposition='auto',
+            textfont=dict(color='white', size=9)
         ))
         fig6.update_layout(
             title=dict(text="Long vs Short PnL", font=dict(color='#6b6b8a', size=11)),
@@ -344,90 +357,13 @@ if not closed_trades.empty:
         )
         st.plotly_chart(fig6, use_container_width=True)
 
-# ─── TRADE HISTORY ────────────────────────────────────────────
-
-if not closed_trades.empty:
-    st.markdown("")
- st.markdown('<div class="section-header">Performance Analysis</div>', unsafe_allow_html=True)
-
-    col_pnl, col_exit, col_token, col_direction = st.columns(4)
-
-    with col_pnl:
-        colors = ['#00d4aa' if p > 0 else '#ff4b6e' for p in closed_trades['pnl']]
-        fig3 = go.Figure()
-        fig3.add_trace(go.Bar(x=list(range(1, len(closed_trades)+1)),
-                               y=closed_trades['pnl'], marker_color=colors))
-        fig3.update_layout(
-            title=dict(text="PnL Per Trade", font=dict(color='#6b6b8a', size=11)),
-            height=220, margin=dict(l=0, r=0, t=30, b=0),
-            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-            yaxis=dict(gridcolor='rgba(42,42,62,0.5)', tickfont=dict(color='#4a4a6a', size=9)),
-            xaxis=dict(gridcolor='rgba(42,42,62,0.5)', tickfont=dict(color='#4a4a6a', size=9)),
-            showlegend=False
-        )
-        st.plotly_chart(fig3, use_container_width=True)
-
-    with col_exit:
-        exit_counts = closed_trades['exit_reason'].value_counts()
-        fig4 = px.pie(values=exit_counts.values, names=exit_counts.index, hole=0.5,
-                      color_discrete_map={'take_profit': '#00d4aa', 'stop_loss': '#ff4b6e', 'time_stop': '#ffa500'})
-        fig4.update_layout(
-            title=dict(text="Exit Reasons", font=dict(color='#6b6b8a', size=11)),
-            height=220, margin=dict(l=0, r=0, t=30, b=0),
-            paper_bgcolor='rgba(0,0,0,0)',
-            legend=dict(font=dict(color='#6b6b8a', size=9))
-        )
-        st.plotly_chart(fig4, use_container_width=True)
-
-    with col_token:
-        token_pnl = closed_trades.copy()
-        token_pnl['token'] = token_pnl['symbol'].str.replace('/USDT:USDT', '')
-        token_summary = token_pnl.groupby('token')['pnl'].sum().sort_values()
-        fig5 = go.Figure()
-        fig5.add_trace(go.Bar(
-            x=token_summary.values, y=token_summary.index,
-            orientation='h',
-            marker_color=['#00d4aa' if v > 0 else '#ff4b6e' for v in token_summary.values]
-        ))
-        fig5.update_layout(
-            title=dict(text="PnL by Token", font=dict(color='#6b6b8a', size=11)),
-            height=220, margin=dict(l=0, r=0, t=30, b=0),
-            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-            yaxis=dict(tickfont=dict(color='#4a4a6a', size=9)),
-            xaxis=dict(gridcolor='rgba(42,42,62,0.5)', tickfont=dict(color='#4a4a6a', size=9)),
-            showlegend=False
-        )
-        st.plotly_chart(fig5, use_container_width=True)
-
-    with col_direction:
-        long_pnl = closed_trades[closed_trades['signal'] == 'long']['pnl'].sum()
-        short_pnl = closed_trades[closed_trades['signal'] == 'short']['pnl'].sum()
-        long_count = len(closed_trades[closed_trades['signal'] == 'long'])
-        short_count = len(closed_trades[closed_trades['signal'] == 'short'])
-        fig6 = go.Figure()
-        fig6.add_trace(go.Bar(
-            x=['LONG', 'SHORT'], y=[long_pnl, short_pnl],
-            marker_color=['#00d4aa', '#ff4b6e'],
-            text=[f'{long_count} trades', f'{short_count} trades'],
-            textposition='auto', textfont=dict(color='white', size=9)
-        ))
-        fig6.update_layout(
-            title=dict(text="Long vs Short PnL", font=dict(color='#6b6b8a', size=11)),
-            height=220, margin=dict(l=0, r=0, t=30, b=0),
-            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-            yaxis=dict(gridcolor='rgba(42,42,62,0.5)', tickfont=dict(color='#4a4a6a', size=9)),
-            xaxis=dict(tickfont=dict(color='#6b6b8a', size=10)),
-            showlegend=False
-        )
-        st.plotly_chart(fig6, use_container_width=True)
-
-# ─── TRADE HISTORY ────────────────────────────────────────────
-
+# TRADE HISTORY
 if not closed_trades.empty:
     st.markdown("")
     st.markdown('<div class="section-header">Trade History</div>', unsafe_allow_html=True)
     display = closed_trades[['symbol', 'signal', 'entry_price', 'exit_price',
-                              'pnl', 'pnl_pct', 'exit_reason', 'entry_time', 'exit_time']].copy()
+                              'pnl', 'pnl_pct', 'exit_reason',
+                              'entry_time', 'exit_time']].copy()
     display['symbol'] = display['symbol'].str.replace('/USDT:USDT', '')
     display['entry_time'] = display['entry_time'].str[:16].str.replace('T', ' ')
     display['exit_time'] = display['exit_time'].str[:16].str.replace('T', ' ')
@@ -435,15 +371,17 @@ if not closed_trades.empty:
                         'PnL $', 'PnL %', 'Exit Reason', 'Entry Time', 'Exit Time']
     st.dataframe(display, use_container_width=True, hide_index=True)
 
-# ─── FOOTER ──────────────────────────────────────────────────
-
+# FOOTER
 st.markdown('<hr style="border:none; border-top:1px solid #1e1e2e; margin:1.5rem 0 0.5rem;">', unsafe_allow_html=True)
 col_f1, col_f2, col_f3 = st.columns(3)
+
 with col_f1:
     if last_cycle:
         st.markdown(f'<span style="color:#4a4a6a; font-size:0.72rem; font-family:Space Mono,monospace;">LAST CYCLE: {last_cycle[:16].replace("T"," ")}</span>', unsafe_allow_html=True)
+
 with col_f2:
     st.markdown(f'<span style="color:#4a4a6a; font-size:0.72rem; font-family:Space Mono,monospace; display:block; text-align:center;">INITIAL CAPITAL: ${INITIAL_CAPITAL:,.0f} USDT</span>', unsafe_allow_html=True)
+
 with col_f3:
     now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     st.markdown(f'<span style="color:#4a4a6a; font-size:0.72rem; font-family:Space Mono,monospace; display:block; text-align:right;">REFRESHED: {now}</span>', unsafe_allow_html=True)
