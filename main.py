@@ -3,10 +3,9 @@ import sqlite3
 import logging
 import schedule
 from datetime import datetime, timezone
-from config import (TIMEFRAME, MAX_OPEN_TRADES, DB_PATH, LOG_PATH)
-from data_feed import (get_exchange, get_top_100_symbols,
-                       get_available_futures_symbols, fetch_all_ohlcv,
-                       get_current_price)
+from config import (TIMEFRAME, MAX_OPEN_TRADES, DB_PATH, LOG_PATH, DEPLOY_TOKENS)
+from data_feed import (get_exchange, get_available_futures_symbols,
+                       fetch_all_ohlcv, get_current_price)
 from strategy import (generate_signal, calculate_momentum_score,
                       rank_signals, detect_market_regime, add_indicators)
 from paper_trader import (init_db, get_open_trades, open_trade,
@@ -19,42 +18,42 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+
 def run_bot():
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Bot cycle starting...")
 
     try:
-        # --- STEP 1: Connect to exchange ---
+        # STEP 1 — Connect
         exchange = get_exchange()
-        print("✓ Connected to Binance Futures Testnet")
+        print("✓ Connected to Binance Futures Demo")
 
-        # --- STEP 2: Get tradeable universe ---
-        top_100 = get_top_100_symbols()
-        symbols = get_available_futures_symbols(exchange, top_100)
-        print(f"✓ Universe: {len(symbols)} symbols")
+        # STEP 2 — Use validated token universe only
+        symbols = get_available_futures_symbols(exchange, DEPLOY_TOKENS)
+        print(f"✓ Universe: {len(symbols)} validated symbols")
 
         if not symbols:
-            print("✗ No symbols found. Skipping cycle.")
+            print("✗ No symbols available. Skipping cycle.")
             return
 
-        # --- STEP 3: Fetch OHLCV data ---
+        # STEP 3 — Fetch OHLCV data
         print("Fetching market data...")
         ohlcv_data = fetch_all_ohlcv(exchange, symbols, timeframe=TIMEFRAME, limit=200)
         print(f"✓ Data fetched for {len(ohlcv_data)} symbols")
 
-        # --- STEP 4: Detect market regime using BTC ---
-        btc_symbol = "BTC/USDT:USDT"
-        btc_df = ohlcv_data.get(btc_symbol)
+        # STEP 4 — Detect market regime using BTC
+        from data_feed import fetch_ohlcv
+        btc_df = fetch_ohlcv(exchange, "BTC/USDT:USDT", timeframe=TIMEFRAME, limit=200)
         regime = detect_market_regime(btc_df)
         print(f"✓ Market regime: {regime.upper()}")
 
-        # --- STEP 5: Get current prices ---
+        # STEP 5 — Get current prices
         current_prices = {}
         for symbol in ohlcv_data:
             price = get_current_price(exchange, symbol)
             if price:
                 current_prices[symbol] = price
 
-        # --- STEP 6: Check exits on open trades ---
+        # STEP 6 — Check exits on open trades
         conn = sqlite3.connect(DB_PATH)
         open_trades = get_open_trades(conn)
         print(f"✓ Open trades: {len(open_trades)}")
@@ -65,21 +64,27 @@ def run_bot():
 
         check_exits(conn, open_trades, current_prices, ohlcv_with_indicators)
 
-        # --- STEP 7: Generate signals ---
-        open_trades = get_open_trades(conn)  # refresh after exits
+        # STEP 7 — Generate signals using per-token strategies
+        open_trades = get_open_trades(conn)
 
         if len(open_trades) < MAX_OPEN_TRADES:
             signals_found = []
 
             for symbol, df in ohlcv_data.items():
-                signal = generate_signal(df)
+                # Pass symbol so strategy routes to correct per-token strategy
+                signal = generate_signal(df, symbol=symbol)
                 if signal:
-                    # Skip if regime is ranging — reduce position, don't open new
+                    # Regime filter — but allow both long and short based on signal
                     if regime == 'ranging':
                         continue
-                    # In bearish regime — only allow shorts
                     if regime == 'bearish' and signal == 'long':
-                        continue
+                        # Only skip longs in STRONGLY bearish regime
+                        # Check if this specific token is showing independent strength
+                        df_ind = add_indicators(df)
+                        latest = df_ind.iloc[-1]
+                        # Allow long if token is above its own VWAP and EMA
+                        if latest['close'] < latest['vwap']:
+                            continue
 
                     momentum = calculate_momentum_score(df)
                     signals_found.append({
@@ -89,7 +94,7 @@ def run_bot():
                         'momentum_score': momentum
                     })
 
-            # --- STEP 8: Rank and execute best signals ---
+            # STEP 8 — Rank and execute
             ranked = rank_signals(signals_found)
             slots_available = MAX_OPEN_TRADES - len(open_trades)
             executed = 0
@@ -112,15 +117,14 @@ def run_bot():
                 print(f"  → {len(signals_found)} signals found but no slots / regime blocked")
             elif not signals_found:
                 print("  → No signals this cycle")
-
         else:
             print("  → Max open trades reached, skipping signal scan")
 
-        # --- STEP 9: Save portfolio snapshot ---
+        # STEP 9 — Save snapshot
         save_portfolio_snapshot(conn)
         conn.close()
 
-        # --- STEP 10: Print performance summary ---
+        # STEP 10 — Print summary
         conn = sqlite3.connect(DB_PATH)
         stats = get_performance_stats(conn)
         conn.close()
@@ -141,19 +145,18 @@ def run_bot():
 
 def main():
     print("=" * 50)
-    print("  CRYPTO TRADING AI AGENT — PAPER MODE")
+    print("  CRYPTO TRADING AI AGENT")
+    print("  Paper Trading Mode")
     print("=" * 50)
 
-    # Initialize database
     init_db()
     print("✓ Database initialized")
 
-    # Run immediately on start
     run_bot()
 
-    # Schedule to run every 4 hours (matching timeframe)
-    schedule.every(4).hours.do(run_bot)
-    print("\n✓ Bot scheduled every 4 hours. Running...")
+    # Schedule every 1 hour (upgraded from 4H)
+    schedule.every(1).hours.do(run_bot)
+    print("\n✓ Agent scheduled every 1 hour. Running...")
     print("  Press Ctrl+C to stop.\n")
 
     while True:
