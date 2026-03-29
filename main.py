@@ -141,7 +141,7 @@ def run_bot():
 
 def main():
     print("=" * 50)
-    print("  CRYPTO FUTURES TRADING BOT — PAPER MODE")
+    print("  CRYPTO TRADING AI AGENT — PAPER MODE")
     print("=" * 50)
 
     # Initialize database
