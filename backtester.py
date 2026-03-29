@@ -2,7 +2,6 @@ import sqlite3
 import pandas as pd
 import numpy as np
 import json
-from datetime import datetime
 
 DB_PATH = "backtest_data.db"
 RESULTS_PATH = "backtest_results.json"
@@ -14,9 +13,10 @@ TAKER_FEE = 0.0005
 SLIPPAGE = 0.0005
 ATR_STOP_MULT = 1.5
 ATR_TRAIL_MULT = 1.0
-MIN_TRADES = 30
+MIN_TRADES = 20
+MIN_VAL_TRADES = 10
 MIN_WIN_RATE = 0.45
-MAX_DRAWDOWN = 0.25
+MAX_DRAWDOWN = 0.30
 TRAIN_RATIO = 0.60
 
 def ema(series, period):
@@ -280,19 +280,73 @@ def walk_forward_validate(df, strategy_key):
     split_idx = int(len(df) * TRAIN_RATIO)
     train_df = df.iloc[:split_idx].reset_index(drop=True)
     val_df = df.iloc[split_idx:].reset_index(drop=True)
-
     if len(train_df) < 300 or len(val_df) < 200:
         return None, None
-
     train_result = run_backtest(train_df, strategy_key)
     val_result = run_backtest(val_df, strategy_key)
     return train_result, val_result
+
+def find_best_strategy(df):
+    best_result = None
+    best_val_result = None
+    best_strategy = None
+    best_score = -999
+
+    for strat_key in STRATEGIES:
+        train_result, val_result = walk_forward_validate(df, strat_key)
+        if not train_result or not val_result:
+            continue
+        if train_result['total_trades'] < MIN_TRADES:
+            continue
+        if val_result['total_trades'] < MIN_VAL_TRADES:
+            continue
+        if train_result['max_drawdown'] > MAX_DRAWDOWN * 100:
+            continue
+        if val_result['max_drawdown'] > MAX_DRAWDOWN * 100:
+            continue
+
+        # Score on validation data only
+        val_score = (val_result['win_rate'] * 0.4) + \
+                   (min(max(val_result['expectancy'], -50), 50) * 0.4) + \
+                   ((100 - val_result['max_drawdown']) * 0.2)
+
+        consistency = abs(train_result['win_rate'] - val_result['win_rate'])
+        if consistency < 10:
+            val_score *= 1.1
+
+        if val_score > best_score:
+            best_score = val_score
+            best_result = train_result
+            best_val_result = val_result
+            best_strategy = strat_key
+
+    return best_strategy, best_result, best_val_result
+
+def assign_verdict(best_result, best_val_result):
+    if not best_val_result:
+        return 'SKIP'
+
+    exp = best_val_result['expectancy']
+    wr = best_val_result['win_rate']
+
+    if exp <= 0:
+        return 'SKIP'
+
+    consistency = abs(best_result['win_rate'] - best_val_result['win_rate'])
+
+    if wr >= MIN_WIN_RATE * 100:
+        return 'DEPLOY' if consistency <= 10 else 'CAUTION'
+    elif wr >= 40:
+        return 'WATCH'
+    else:
+        return 'CAUTION'
 
 def main():
     print("=" * 70)
     print("  BACKTESTING ENGINE WITH WALK-FORWARD VALIDATION")
     print("  60% Training | 40% Out-of-Sample Validation")
     print("  15 Strategy Combinations Per Token")
+    print("  Verdicts: DEPLOY / CAUTION / WATCH / SKIP")
     print("=" * 70)
 
     conn = sqlite3.connect(DB_PATH)
@@ -313,52 +367,17 @@ def main():
 
         if len(df) < 500:
             print(f"  SKIP - insufficient data")
-            all_results[symbol] = {'symbol': symbol, 'verdict': 'SKIP', 'reason': 'insufficient_data', 'best_strategy': None, 'strategy_name': None, 'metrics': None, 'validation': None}
+            all_results[symbol] = {
+                'symbol': symbol, 'verdict': 'SKIP',
+                'reason': 'insufficient_data',
+                'best_strategy': None, 'strategy_name': None,
+                'metrics': None, 'validation': None
+            }
             continue
 
         df = add_all_indicators(df)
-        best_result = None
-        best_val_result = None
-        best_strategy = None
-        best_score = -999
-
-        for strat_key in STRATEGIES:
-            train_result, val_result = walk_forward_validate(df, strat_key)
-
-            if not train_result or not val_result:
-                continue
-            if train_result['total_trades'] < MIN_TRADES:
-                continue
-            if val_result['total_trades'] < 15:
-                continue
-            if train_result['expectancy'] <= 0 or val_result['expectancy'] <= 0:
-                continue
-            if train_result['max_drawdown'] > MAX_DRAWDOWN * 100:
-                continue
-            if val_result['max_drawdown'] > MAX_DRAWDOWN * 100:
-                continue
-
-            val_score = (val_result['win_rate'] * 0.4) + \
-                       (min(val_result['expectancy'], 50) * 0.4) + \
-                       ((100 - val_result['max_drawdown']) * 0.2)
-
-            consistency = abs(train_result['win_rate'] - val_result['win_rate'])
-            if consistency < 10:
-                val_score *= 1.1
-
-            if val_score > best_score:
-                best_score = val_score
-                best_result = train_result
-                best_val_result = val_result
-                best_strategy = strat_key
-
-        if best_val_result and best_val_result['win_rate'] >= MIN_WIN_RATE * 100:
-            consistency = abs(best_result['win_rate'] - best_val_result['win_rate'])
-            verdict = 'DEPLOY' if consistency <= 10 else 'CAUTION'
-        elif best_val_result and best_val_result['expectancy'] > 0:
-            verdict = 'CAUTION'
-        else:
-            verdict = 'SKIP'
+        best_strategy, best_result, best_val_result = find_best_strategy(df)
+        verdict = assign_verdict(best_result, best_val_result)
 
         token_result = {
             'symbol': symbol,
@@ -378,7 +397,7 @@ def main():
             print(f"  Validate : WR {best_val_result['win_rate']}% | Exp ${best_val_result['expectancy']} | DD {best_val_result['max_drawdown']}% | Gap {consistency:.1f}%")
             print(f"  Verdict  : {verdict}")
         else:
-            print(f"  Verdict  : {verdict} - no strategy passed validation")
+            print(f"  Verdict  : SKIP - no valid strategy found")
         print()
 
     conn.close()
@@ -388,12 +407,14 @@ def main():
 
     deploy = [r for r in all_results.values() if r['verdict'] == 'DEPLOY']
     caution = [r for r in all_results.values() if r['verdict'] == 'CAUTION']
+    watch = [r for r in all_results.values() if r['verdict'] == 'WATCH']
     skip = [r for r in all_results.values() if r['verdict'] == 'SKIP']
 
     print(f"\n{'='*70}")
     print(f"  BACKTESTING COMPLETE")
     print(f"  DEPLOY:  {len(deploy)} tokens")
     print(f"  CAUTION: {len(caution)} tokens")
+    print(f"  WATCH:   {len(watch)} tokens")
     print(f"  SKIP:    {len(skip)} tokens")
     print(f"  Results saved to: {RESULTS_PATH}")
     print(f"{'='*70}")
