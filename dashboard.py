@@ -36,7 +36,7 @@ st.markdown("""
         margin-bottom: 0.3rem;
     }
     .metric-value {
-        font-size: 1.8rem;
+        font-size: 1.4rem;
         font-weight: 600;
         color: #e8e8f0;
         font-family: 'Space Mono', monospace;
@@ -132,7 +132,7 @@ def get_market_regime_from_log():
 col_title, col_status = st.columns([3, 1])
 with col_title:
     st.markdown("""
-        <h1 style="font-family:'Space Mono',monospace; font-size:1.4rem; letter-spacing:0.05em; margin:0; color:#e8e8f0;">
+        <h1 style="font-family:'Space Mono',monospace; font-size:1.4rem; letter-spacing:0.05em; margin:0; color:#ffffff; text-shadow: 0 0 20px rgba(0,212,170,0.3);">
         ⚡ CRYPTO TRADING AI AGENT
         </h1>
         <p style="color:#4a4a6a; font-size:0.8rem; margin:0; font-family:'Space Mono',monospace;">
