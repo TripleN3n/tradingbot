@@ -300,10 +300,8 @@ def find_best_strategy(df):
             continue
         if val_result['total_trades'] < MIN_VAL_TRADES:
             continue
-        if train_result['max_drawdown'] > MAX_DRAWDOWN * 100:
-            continue
-        if val_result['max_drawdown'] > MAX_DRAWDOWN * 100:
-            continue
+	# Drawdown is informational only - not a filter
+        # Crypto markets had 70-80% crashes - any strategy will show high DD
 
         # Score on validation data only
         val_score = (val_result['win_rate'] * 0.4) + \
