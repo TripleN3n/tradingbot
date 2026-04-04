@@ -1,0 +1,8 @@
+*.log
+logs/
+__pycache__/
+*.pyc
+.env
+data/*.db
+backups/
+.sync_state.json
