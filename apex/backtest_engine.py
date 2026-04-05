@@ -1,17 +1,27 @@
 # =============================================================================
 # APEX — Adaptive Per-token Execution Strategy Engine
-# apex/backtest_engine.py — Vectorized Multi-Strategy Engine v4.1
+# apex/backtest_engine.py — Vectorized Multi-Strategy Engine v4.2
 # =============================================================================
-# SPEED IMPROVEMENT in v4.1:
-# All indicator signals pre-computed as numpy arrays ONCE per window.
-# Inner loop does array lookups only — no per-candle calculations.
-# Expected speedup: 5-10x over v4.0
+# CHANGES FROM v4.1:
 #
-# STRATEGY TYPES:
-# 1. MTF Trend      — 1D+4H confirm, 1H triggers
-# 2. Single TF      — Best single timeframe (1H, 4H, 1D)
-# 3. Mean Reversion — RSI extremes + Bollinger boundaries
-# 4. Breakout       — Volume surge + Bollinger squeeze
+# _get_tf_direction():
+#   Extracted from precompute_mtf() inner closure to a module-level helper.
+#   Reused by both precompute_mtf() and the new precompute_mtf_4h().
+#
+# precompute_mtf_4h():
+#   New function. Pre-computes MTF direction for every 4H candle based on
+#   1D direction only (1D confirms → 4H triggers).
+#   Mirrors precompute_mtf() but operates on 4H candles instead of 1H.
+#
+# backtest_mtf_4h():
+#   New function. MTF trend backtest on 4H candles using precomputed arrays.
+#   Same logic as backtest_mtf() but uses 4H signal arrays and time stop.
+#
+# run_backtest_for_token():
+#   Added 4H MTF strategy section after existing MTF and single-TF sections.
+#   4H MTF doubles the MTF search coverage — previously only 1H entries
+#   got MTF treatment. Many tokens that produce 0 valid 1H MTF strategies
+#   can have valid 4H MTF strategies.
 # =============================================================================
 
 import pandas as pd
@@ -93,7 +103,7 @@ def precompute_signals(df: pd.DataFrame) -> dict:
     """
     Pre-compute ALL indicator signals as numpy arrays in one pass.
     Returns dict of signal arrays: 1=long, -1=short, 0=no signal.
-    This is the core speedup — computed ONCE, reused across all permutations.
+    Core speedup — computed ONCE, reused across all permutations.
     """
     n = len(df)
 
@@ -111,52 +121,40 @@ def precompute_signals(df: pd.DataFrame) -> dict:
     bbw    = df["bb_width"].values
     vr     = df["volume_ratio"].values
 
-    # EMA signal: fast > slow = long, fast < slow = short
     ema_sig = np.zeros(n, dtype=np.int8)
     ema_sig[ef > es] = 1
     ema_sig[ef < es] = -1
 
-    # Macro ref signal: close > macro_ref = long
     mac_sig = np.zeros(n, dtype=np.int8)
     mac_sig[close > mr] = 1
     mac_sig[close < mr] = -1
 
-    # RSI signal
-    rsi_sig = np.zeros(n, dtype=np.int8)
+    rsi_sig  = np.zeros(n, dtype=np.int8)
     rsi_prev = np.roll(rsi, 1); rsi_prev[0] = rsi[0]
-    rsi_sig[rsi < RSI["oversold"]]  = 1
+    rsi_sig[rsi < RSI["oversold"]]   = 1
     rsi_sig[rsi > RSI["overbought"]] = -1
     rsi_sig[(rsi > rsi_prev) & (rsi < 60) & (rsi_sig == 0)] = 1
     rsi_sig[(rsi < rsi_prev) & (rsi > 40) & (rsi_sig == 0)] = -1
 
-    # MACD signal
-    macd_sig  = np.zeros(n, dtype=np.int8)
+    macd_sig   = np.zeros(n, dtype=np.int8)
     mhist_prev = np.roll(mhist, 1); mhist_prev[0] = mhist[0]
     macd_sig[(macd > msig) & (mhist > mhist_prev)] = 1
     macd_sig[(macd < msig) & (mhist < mhist_prev)] = -1
 
-    # Bollinger signal
     bb_sig   = np.zeros(n, dtype=np.int8)
     bbw_prev = np.roll(bbw, 1); bbw_prev[0] = bbw[0]
-    # Squeeze breakout
     expanding = bbw > bbw_prev
     bb_sig[expanding & (close > bbm)] = 1
     bb_sig[expanding & (close < bbm)] = -1
-    # Mean reversion at bands
     bb_sig[close <= bbl] = 1
     bb_sig[close >= bbu] = -1
 
-    # Volume signal
-    vol_sig   = np.zeros(n, dtype=np.int8)
+    vol_sig    = np.zeros(n, dtype=np.int8)
     close_prev = np.roll(close, 1); close_prev[0] = close[0]
     high_vol   = vr >= VOLUME["min_multiplier"]
     vol_sig[high_vol & (close > close_prev)] = 1
     vol_sig[high_vol & (close <= close_prev)] = -1
 
-    # Volume ratio array for filtering
-    vol_ratio = vr
-
-    # ATR array
     atr = df["atr"].values
 
     return {
@@ -166,7 +164,7 @@ def precompute_signals(df: pd.DataFrame) -> dict:
         "macd":      macd_sig,
         "bollinger": bb_sig,
         "volume":    vol_sig,
-        "vol_ratio": vol_ratio,
+        "vol_ratio": vr,
         "atr":       atr,
         "close":     close,
         "high":      df["high"].values,
@@ -176,23 +174,39 @@ def precompute_signals(df: pd.DataFrame) -> dict:
     }
 
 
+# =============================================================================
+# MTF DIRECTION HELPER
+# =============================================================================
+
+def _get_tf_direction(df: pd.DataFrame, i: int) -> int:
+    """
+    Get trend direction for a single candle from a DataFrame.
+    Extracted to module level so it can be reused by multiple MTF functions.
+    Returns: 1=long, -1=short, 0=neutral/indeterminate.
+    """
+    if i < 1 or i >= len(df):
+        return 0
+    row = df.iloc[i]
+    ef  = row.get("ema_fast");  es = row.get("ema_slow")
+    mr  = row.get("macro_ref"); cl = row.get("close")
+    if pd.isna(ef) or pd.isna(es) or pd.isna(mr):
+        return 0
+    if ef > es and cl > mr:
+        return 1
+    if ef < es and cl < mr:
+        return -1
+    return 0
+
+
 def precompute_mtf(df_1h: pd.DataFrame, df_4h: pd.DataFrame, df_1d: pd.DataFrame) -> np.ndarray:
     """
-    Pre-compute MTF direction for every 1H candle as numpy array.
+    Pre-compute MTF direction for every 1H candle.
+    Both 4H AND 1D must agree for a non-zero direction.
     Returns array: 1=long, -1=short, 0=no signal.
     O(n) pointer scan — computed ONCE per window.
     """
     n   = len(df_1h)
     mtf = np.zeros(n, dtype=np.int8)
-
-    def get_dir(df, i):
-        if i < 1 or i >= len(df): return 0
-        ef = df["ema_fast"].iloc[i]; es = df["ema_slow"].iloc[i]
-        mr = df["macro_ref"].iloc[i]; cl = df["close"].iloc[i]
-        if pd.isna(ef) or pd.isna(es) or pd.isna(mr): return 0
-        if ef > es and cl > mr: return 1
-        if ef < es and cl < mr: return -1
-        return 0
 
     i4 = 0; i1 = 0
     n4 = len(df_4h); n1 = len(df_1d)
@@ -201,10 +215,37 @@ def precompute_mtf(df_1h: pd.DataFrame, df_4h: pd.DataFrame, df_1d: pd.DataFrame
         while i4 < n4-1 and df_4h.index[i4+1] <= ts: i4 += 1
         while i1 < n1-1 and df_1d.index[i1+1] <= ts: i1 += 1
         if i4 < 1 or i1 < 1: continue
-        d4 = get_dir(df_4h, i4)
-        d1 = get_dir(df_1d, i1)
+        d4 = _get_tf_direction(df_4h, i4)
+        d1 = _get_tf_direction(df_1d, i1)
         if d4 != 0 and d4 == d1:
             mtf[idx] = d4
+
+    return mtf
+
+
+def precompute_mtf_4h(df_4h: pd.DataFrame, df_1d: pd.DataFrame) -> np.ndarray:
+    """
+    Pre-compute MTF direction for every 4H candle using 1D confirmation.
+
+    NEW in v4.2: 4H MTF strategy — 1D sets direction, 4H triggers entry.
+    For each 4H candle, checks the corresponding 1D candle's direction.
+    If 1D direction is clear (non-neutral), uses it as the required direction.
+
+    Returns array: 1=long, -1=short, 0=no signal.
+    O(n) pointer scan — computed ONCE per window.
+    """
+    n   = len(df_4h)
+    mtf = np.zeros(n, dtype=np.int8)
+
+    i1 = 0
+    n1 = len(df_1d)
+
+    for idx, ts in enumerate(df_4h.index):
+        while i1 < n1-1 and df_1d.index[i1+1] <= ts: i1 += 1
+        if i1 < 1: continue
+        d1 = _get_tf_direction(df_1d, i1)
+        if d1 != 0:
+            mtf[idx] = d1
 
     return mtf
 
@@ -222,10 +263,10 @@ def calc_sl_tp(sigs, i, direction, rrr):
     atr_dist = atr * SL["atr_multiplier"]
     lb       = max(0, i - 10)
 
-    if direction == 1:  # long
+    if direction == 1:
         sl_dist = max(entry - (sigs["low"][lb:i+1].min() - atr*0.1), atr_dist)
         return entry, entry - sl_dist, entry + sl_dist * rrr, sl_dist
-    else:  # short
+    else:
         sl_dist = max((sigs["high"][lb:i+1].max() + atr*0.1) - entry, atr_dist)
         return entry, entry + sl_dist, entry - sl_dist * rrr, sl_dist
 
@@ -237,9 +278,9 @@ def calc_sl_tp(sigs, i, direction, rrr):
 def simulate(sigs, idx, direction, entry, sl, tp_unused, sl_dist, tf):
     """
     Tiered exit:
-    - 40% at 1.5x RRR
-    - 30% at 2.0x RRR
-    - 30% trailing with 1.5x ATR
+    - 40% at 1.5× RRR
+    - 30% at 2.0× RRR
+    - 30% trailing with 1.5× ATR
     """
     ts      = TIME_STOP_CANDLES.get(tf, 24)
     n       = len(sigs["close"])
@@ -302,17 +343,23 @@ def simulate(sigs, idx, direction, entry, sl, tp_unused, sl_dist, tf):
 
 
 # =============================================================================
-# FAST BACKTEST WINDOWS — Use pre-computed signal arrays
+# BACKTEST STRATEGIES
 # =============================================================================
 
+def _get_cooldown(tf):
+    cd_cfg = FILTERS["cooldown"]["candles_after_sl"]
+    return cd_cfg.get(tf, 4) if isinstance(cd_cfg, dict) else cd_cfg
+
+
 def backtest_mtf(sigs, indicators, min_conf, rrr, mtf_arr, tf="1h"):
-    """MTF trend backtest using pre-computed signal arrays."""
+    """MTF trend backtest using pre-computed signal arrays (1H entry)."""
     trades = []; cd = 0
     n      = len(sigs["close"])
     rsi_lm = FILTERS.get("rsi_zone", {}).get("long_max_rsi", 60)
-    rsi_sm = FILTERS.get("rsi_zone", {}).get("short_min_rsi", 40)
-    ema_md = FILTERS.get("price_position", {}).get("max_ema_distance", 0.03)
+    rsi_sm = FILTERS.get("rsi_zone", {}).get("short_min_rsi", 28)
+    ema_md = FILTERS.get("price_position", {}).get("max_ema_distance", 0.08)
     vol_mn = VOLUME["min_multiplier"]
+    cd_len = _get_cooldown(tf)
 
     for i in range(1, n-1):
         if cd > 0: cd -= 1; continue
@@ -321,23 +368,15 @@ def backtest_mtf(sigs, indicators, min_conf, rrr, mtf_arr, tf="1h"):
         req = mtf_arr[i]
         if req == 0: continue
 
-        # Count agreeing indicators
-        agree = 0
-        for ind in indicators:
-            if sigs[ind][i] == req: agree += 1
+        agree = sum(1 for ind in indicators if sigs[ind][i] == req)
         if agree < min_conf: continue
-
-        # EMA and macro_ref mandatory
         if sigs["ema"][i] != req or sigs["macro_ref"][i] != req: continue
 
         direction = req
-
-        # RSI zone filter
         rsi = sigs["rsi_raw"][i]
         if direction == 1  and rsi > rsi_lm: continue
         if direction == -1 and rsi < rsi_sm: continue
 
-        # Price position filter
         ef = sigs["ema_fast"][i]; cl = sigs["close"][i]
         if ef > 0 and abs(cl - ef) / ef > ema_md: continue
 
@@ -347,7 +386,57 @@ def backtest_mtf(sigs, indicators, min_conf, rrr, mtf_arr, tf="1h"):
         trade = simulate(sigs, i, direction, entry, sl, tp, sl_dist, tf)
         trades.append(trade)
         if trade["exit_reason"] == "stop_loss":
-            cd = (FILTERS["cooldown"]["candles_after_sl"].get(tf, 4) if isinstance(FILTERS["cooldown"]["candles_after_sl"], dict) else FILTERS["cooldown"]["candles_after_sl"])
+            cd = cd_len
+
+    return trades
+
+
+def backtest_mtf_4h(sigs, indicators, min_conf, rrr, mtf_arr, tf="4h"):
+    """
+    NEW in v4.2: MTF trend backtest on 4H candles using 1D confirmation.
+
+    Same logic as backtest_mtf() but:
+    - Operates on 4H signal arrays
+    - Uses 4H time stop (12 candles = 2 days)
+    - RSI zone and price position filters applied to 4H data
+
+    This doubles the MTF strategy coverage — previously only 1H entries
+    received MTF treatment.
+    """
+    trades = []; cd = 0
+    n      = len(sigs["close"])
+    rsi_lm = FILTERS.get("rsi_zone", {}).get("long_max_rsi", 60)
+    rsi_sm = FILTERS.get("rsi_zone", {}).get("short_min_rsi", 28)
+    ema_md = FILTERS.get("price_position", {}).get("max_ema_distance", 0.08)
+    vol_mn = VOLUME["min_multiplier"]
+    cd_len = _get_cooldown(tf)
+
+    for i in range(1, n-1):
+        if cd > 0: cd -= 1; continue
+        if sigs["vol_ratio"][i] < vol_mn or np.isnan(sigs["vol_ratio"][i]): continue
+
+        req = mtf_arr[i]
+        if req == 0: continue
+
+        agree = sum(1 for ind in indicators if sigs[ind][i] == req)
+        if agree < min_conf: continue
+        if sigs["ema"][i] != req or sigs["macro_ref"][i] != req: continue
+
+        direction = req
+        rsi = sigs["rsi_raw"][i]
+        if direction == 1  and rsi > rsi_lm: continue
+        if direction == -1 and rsi < rsi_sm: continue
+
+        ef = sigs["ema_fast"][i]; cl = sigs["close"][i]
+        if ef > 0 and abs(cl - ef) / ef > ema_md: continue
+
+        r = calc_sl_tp(sigs, i, direction, rrr)
+        if r is None: continue
+        entry, sl, tp, sl_dist = r
+        trade = simulate(sigs, i, direction, entry, sl, tp, sl_dist, tf)
+        trades.append(trade)
+        if trade["exit_reason"] == "stop_loss":
+            cd = cd_len
 
     return trades
 
@@ -357,17 +446,16 @@ def backtest_single_tf(sigs, indicators, min_conf, rrr, tf):
     trades = []; cd = 0
     n      = len(sigs["close"])
     vol_mn = VOLUME["min_multiplier"]
+    cd_len = _get_cooldown(tf)
 
     for i in range(1, n-1):
         if cd > 0: cd -= 1; continue
         if sigs["vol_ratio"][i] < vol_mn or np.isnan(sigs["vol_ratio"][i]): continue
 
-        # EMA and macro_ref mandatory and must agree
         em = sigs["ema"][i]; mm = sigs["macro_ref"][i]
         if em == 0 or mm == 0 or em != mm: continue
         direction = em
 
-        # Count agreeing indicators
         agree = sum(1 for ind in indicators if sigs[ind][i] == direction)
         if agree < min_conf: continue
 
@@ -377,30 +465,25 @@ def backtest_single_tf(sigs, indicators, min_conf, rrr, tf):
         trade = simulate(sigs, i, direction, entry, sl, tp, sl_dist, tf)
         trades.append(trade)
         if trade["exit_reason"] == "stop_loss":
-            cd = (FILTERS["cooldown"]["candles_after_sl"].get(tf, 4) if isinstance(FILTERS["cooldown"]["candles_after_sl"], dict) else FILTERS["cooldown"]["candles_after_sl"])
+            cd = cd_len
 
     return trades
 
 
 def backtest_mean_reversion(sigs, rrr, tf):
-    """Mean reversion backtest — RSI extremes + Bollinger boundaries."""
+    """Mean reversion: RSI extremes + Bollinger boundaries."""
     trades = []; cd = 0
     n      = len(sigs["close"])
-    close  = sigs["close"]
     rsi    = sigs["rsi_raw"]
+    cd_len = _get_cooldown(tf)
 
-    # Pre-compute MR signals vectorized
-    bb_lower = None; bb_upper = None
-    # Use bollinger signal from sigs — already computed
-    # MR long: RSI < 35 AND bollinger = long
-    # MR short: RSI > 65 AND bollinger = short
     mr_long  = (rsi < 35) & (sigs["bollinger"] == 1)
     mr_short = (rsi > 65) & (sigs["bollinger"] == -1)
 
     for i in range(1, n-1):
         if cd > 0: cd -= 1; continue
 
-        if mr_long[i]:   direction = 1
+        if mr_long[i]:    direction = 1
         elif mr_short[i]: direction = -1
         else: continue
 
@@ -410,26 +493,25 @@ def backtest_mean_reversion(sigs, rrr, tf):
         trade = simulate(sigs, i, direction, entry, sl, tp, sl_dist, tf)
         trades.append(trade)
         if trade["exit_reason"] == "stop_loss":
-            cd = (FILTERS["cooldown"]["candles_after_sl"].get(tf, 4) if isinstance(FILTERS["cooldown"]["candles_after_sl"], dict) else FILTERS["cooldown"]["candles_after_sl"])
+            cd = cd_len
 
     return trades
 
 
 def backtest_breakout(sigs, rrr, tf):
-    """Breakout backtest — volume surge + Bollinger expansion."""
+    """Breakout: volume surge + Bollinger expansion."""
     trades = []; cd = 0
     n      = len(sigs["close"])
+    cd_len = _get_cooldown(tf)
 
-    # Pre-compute breakout signals vectorized
-    high_vol  = sigs["vol_ratio"] >= 1.5
-    bb_expand = sigs["bollinger"] != 0  # BB signal fires on expansion
-    bo_long   = high_vol & (sigs["volume"] == 1) & (sigs["ema"] == 1)
-    bo_short  = high_vol & (sigs["volume"] == -1) & (sigs["ema"] == -1)
+    high_vol = sigs["vol_ratio"] >= 1.5
+    bo_long  = high_vol & (sigs["volume"] == 1) & (sigs["ema"] == 1)
+    bo_short = high_vol & (sigs["volume"] == -1) & (sigs["ema"] == -1)
 
     for i in range(3, n-1):
         if cd > 0: cd -= 1; continue
 
-        if bo_long[i]:   direction = 1
+        if bo_long[i]:    direction = 1
         elif bo_short[i]: direction = -1
         else: continue
 
@@ -439,7 +521,7 @@ def backtest_breakout(sigs, rrr, tf):
         trade = simulate(sigs, i, direction, entry, sl, tp, sl_dist, tf)
         trades.append(trade)
         if trade["exit_reason"] == "stop_loss":
-            cd = (FILTERS["cooldown"]["candles_after_sl"].get(tf, 4) if isinstance(FILTERS["cooldown"]["candles_after_sl"], dict) else FILTERS["cooldown"]["candles_after_sl"])
+            cd = cd_len
 
     return trades
 
@@ -470,10 +552,10 @@ def calc_metrics(trades):
 
 def passes_thresholds(m):
     if m["expectancy"]    < SCORING_MINIMUMS["expectancy"]:    return False
-    if m["win_rate"]      < SCORING_MINIMUMS["win_rate"]:       return False
-    if m["max_drawdown"]  > SCORING_MINIMUMS["max_drawdown"]:   return False
-    if m["profit_factor"] < SCORING_MINIMUMS["profit_factor"]:  return False
-    if m["sharpe_ratio"]  < SCORING_MINIMUMS["sharpe_ratio"]:   return False
+    if m["win_rate"]      < SCORING_MINIMUMS["win_rate"]:      return False
+    if m["max_drawdown"]  > SCORING_MINIMUMS["max_drawdown"]:  return False
+    if m["profit_factor"] < SCORING_MINIMUMS["profit_factor"]: return False
+    if m["sharpe_ratio"]  < SCORING_MINIMUMS["sharpe_ratio"]:  return False
     return True
 
 
@@ -536,7 +618,7 @@ def split_1h(df_1h, df_4h, df_1d):
 
 
 def split_tf(df, tc, vc):
-    if len(df) < tc + vc: return None, None
+    if df is None or len(df) < tc + vc: return None, None
     w = df.iloc[-(tc+vc):]
     return w.iloc[:tc], w.iloc[tc:]
 
@@ -548,9 +630,17 @@ def split_tf(df, tc, vc):
 def run_backtest_for_token(conn, symbol):
     """
     Exhaustive multi-strategy backtest with vectorized signal computation.
-    Pre-computes ALL signals once per window — then reuses across permutations.
+
+    Strategy types tested:
+    1. MTF Trend 1H    — 1D+4H confirm, 1H triggers
+    2. MTF Trend 4H    — 1D confirms, 4H triggers (NEW in v4.2)
+    3. Single TF 1H    — best 1H strategy
+    4. Single TF 4H    — best 4H strategy
+    5. Single TF 1D    — best 1D strategy
+    6. Mean Reversion  — RSI extremes + Bollinger (1H and 4H)
+    7. Breakout        — volume surge + Bollinger (1H and 4H)
     """
-    logger.info(f"Backtesting {symbol} (v4.1 vectorized)...")
+    logger.info(f"Backtesting {symbol} (v4.2 vectorized)...")
 
     df_1h = load_ohlcv(conn, symbol, "1h")
     df_4h = load_ohlcv(conn, symbol, "4h")
@@ -570,7 +660,6 @@ def run_backtest_for_token(conn, symbol):
     except Exception as e:
         logger.error(f"  {symbol} indicator error: {e}"); return []
 
-    # Split windows
     windows = split_1h(df_1h, df_4h, df_1d)
     if windows is None:
         logger.warning(f"  {symbol} insufficient data"); return []
@@ -586,7 +675,7 @@ def run_backtest_for_token(conn, symbol):
     tr_1d, vl_1d = split_tf(df_1d, tc_1d, vc_1d)
 
     # ----------------------------------------------------------------
-    # PRE-COMPUTE ALL SIGNALS ONCE PER WINDOW — KEY SPEEDUP
+    # PRE-COMPUTE ALL SIGNALS ONCE PER WINDOW
     # ----------------------------------------------------------------
     tr_sigs_1h = precompute_signals(tr_1h)
     vl_sigs_1h = precompute_signals(vl_1h)
@@ -597,7 +686,7 @@ def run_backtest_for_token(conn, symbol):
     tr_sigs_1d = precompute_signals(tr_1d) if tr_1d is not None else None
     vl_sigs_1d = precompute_signals(vl_1d) if vl_1d is not None else None
 
-    # MTF direction arrays
+    # MTF direction arrays — 1H (1D+4H confirm)
     mtf_tr = precompute_mtf(tr_1h, f4tr, f1tr)
     mtf_vl = precompute_mtf(vl_1h, f4vl, f1vl)
 
@@ -605,8 +694,15 @@ def run_backtest_for_token(conn, symbol):
     n_mtf_vl = int((mtf_vl != 0).sum())
     logger.info(f"  {symbol} — MTF signals: train={n_mtf_tr}, val={n_mtf_vl}")
 
+    # MTF direction arrays — 4H (1D confirms) — NEW in v4.2
+    mtf4_tr = precompute_mtf_4h(tr_4h, tr_1d) if tr_4h is not None and tr_1d is not None else None
+    mtf4_vl = precompute_mtf_4h(vl_4h, vl_1d) if vl_4h is not None and vl_1d is not None else None
+
+    n_mtf4_tr = int((mtf4_tr != 0).sum()) if mtf4_tr is not None else 0
+    n_mtf4_vl = int((mtf4_vl != 0).sum()) if mtf4_vl is not None else 0
+
     perms = get_permutations()
-    min_t = BACKTEST["min_trades"]
+    min_t  = BACKTEST["min_trades"]
     min_1h = min_t.get("1h", 10) if isinstance(min_t, dict) else 10
     min_4h = min_t.get("4h", 5)  if isinstance(min_t, dict) else 5
     min_1d = min_t.get("1d", 3)  if isinstance(min_t, dict) else 3
@@ -614,7 +710,12 @@ def run_backtest_for_token(conn, symbol):
 
     all_results = []
 
-    logger.info(f"  {symbol} — {len(perms) * len(TIERS)} MTF + {len(perms) * len(TIERS) * 3} single TF + MR + BO")
+    strat_count = len(perms) * len(TIERS)
+    logger.info(
+        f"  {symbol} — "
+        f"{strat_count} MTF-1H + {strat_count} MTF-4H + "
+        f"{strat_count * 3} single TF + MR + BO"
+    )
 
     for tier_name, tier_cfg in TIERS.items():
         rrr      = tier_cfg["min_rrr"]
@@ -622,7 +723,7 @@ def run_backtest_for_token(conn, symbol):
 
         for indicators in perms:
             try:
-                # --- MTF TREND ---
+                # --- MTF TREND 1H (1D+4H confirm → 1H entry) ---
                 if n_mtf_tr >= min_1h and n_mtf_vl >= min_v:
                     tr_t = backtest_mtf(tr_sigs_1h, indicators, min_conf, rrr, mtf_tr, "1h")
                     if len(tr_t) >= min_1h:
@@ -634,6 +735,22 @@ def run_backtest_for_token(conn, symbol):
                                 if ok:
                                     all_results.append(make_result(
                                         symbol, "mtf_trend", "1h", tier_name, tier_cfg,
+                                        indicators, tm, vm, gap, len(tr_t), len(vl_t)
+                                    ))
+
+                # --- MTF TREND 4H (1D confirms → 4H entry) NEW ---
+                if (tr_sigs_4h and vl_sigs_4h and mtf4_tr is not None and mtf4_vl is not None
+                        and n_mtf4_tr >= min_4h and n_mtf4_vl >= min_v):
+                    tr_t = backtest_mtf_4h(tr_sigs_4h, indicators, min_conf, rrr, mtf4_tr, "4h")
+                    if len(tr_t) >= min_4h:
+                        vl_t = backtest_mtf_4h(vl_sigs_4h, indicators, min_conf, rrr, mtf4_vl, "4h")
+                        if len(vl_t) >= min_v:
+                            tm = calc_metrics(tr_t); vm = calc_metrics(vl_t)
+                            if tm and vm and passes_thresholds(vm):
+                                ok, gap = check_overfitting(tm, vm)
+                                if ok:
+                                    all_results.append(make_result(
+                                        symbol, "mtf_trend_4h", "4h", tier_name, tier_cfg,
                                         indicators, tm, vm, gap, len(tr_t), len(vl_t)
                                     ))
 
@@ -810,7 +927,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     conn = get_db_connection()
 
-    for sym in ["ETH/USDT:USDT", "SOL/USDT:USDT", "BTC/USDT:USDT"]:
+    for sym in ["ETH/USDT:USDT", "DOT/USDT:USDT", "DOGE/USDT:USDT"]:
         t0 = time.time()
         results = run_backtest_for_token(conn, sym)
         elapsed = time.time() - t0
@@ -818,7 +935,7 @@ if __name__ == "__main__":
         if results:
             b  = results[0]; vm = b["val_metrics"]
             print(f"  Best: {b['strategy_type']} | {b['timeframe']} | {b['tier']}")
-            print(f"  WR:{vm['win_rate']:.1%} Exp:{vm['expectancy']:.4f} PF:{vm['profit_factor']:.2f} Trades:{vm['n_trades']}")
+            print(f"  WR:{vm['win_rate']:.1%} Exp:{vm['expectancy']:.4f} PF:{vm['profit_factor']:.2f}")
 
     conn.close()
 

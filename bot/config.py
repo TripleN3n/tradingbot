@@ -374,12 +374,13 @@ SCORING_WEIGHTS = {
     "sharpe_ratio":  0.10,
 }
 
+# v3.2: relaxed thresholds — bear-market short strategies can dip just below strict values
 SCORING_MINIMUMS = {
-    "expectancy":    0.0,
-    "win_rate":      0.38,
-    "max_drawdown":  0.25,
-    "profit_factor": 1.1,
-    "sharpe_ratio":  0.3,
+    "expectancy":    0.0,    # Must be positive
+    "win_rate":      0.35,   # 35% minimum (was 38%)
+    "max_drawdown":  0.30,   # 30% max allowed (was 25%)
+    "profit_factor": 1.05,   # Minimum 1.05 (was 1.1)
+    "sharpe_ratio":  0.25,   # Minimum 0.25 (was 0.3)
 }
 
 # =============================================================================
