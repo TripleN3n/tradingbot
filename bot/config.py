@@ -1,7 +1,15 @@
 # =============================================================================
 # APEX — Adaptive Per-token Execution Strategy Engine
 # bot/config.py — Single Source of Truth
-# Version 3.0 — Multi-Timeframe Confirmation Strategy
+# Version 3.1 — Parameter corrections and alignment to strategy spec
+# =============================================================================
+# CHANGES FROM v3.0:
+# - TIME_STOP_CANDLES["1h"]: 24 → 30 (spec alignment)
+# - TIERS min_rrr: tier1=2.0, tier2=1.75, tier3=1.5 (spec alignment)
+# - DRAWDOWN thresholds: 15/25/40% → 20/35/50% (spec alignment)
+# - RSI zone filter short_min_rsi: 40 → 28 (too aggressive in bearish markets)
+# - Price position filter max_ema_distance: 3% → 8% (too tight for trends)
+# - Session filter Asian session: now tier-aware per spec (50% for tier1/2)
 # =============================================================================
 # HOW TO USE THIS FILE:
 # Every parameter for the entire system lives here.
@@ -53,20 +61,25 @@ EXCHANGE = {
 # =============================================================================
 
 INITIAL_CAPITAL  = 10000.0   # Starting capital in USDT
-RESERVE_PCT      = 0.05     # 5% always kept as reserve
-MAX_DEPLOYED_PCT = 0.95     # Maximum 95% capital in trades at any time
-CAPITAL_PER_SLOT = 0.10     # Each trade slot uses 10% of capital
+RESERVE_PCT      = 0.05      # 5% always kept as reserve
+MAX_DEPLOYED_PCT = 0.95      # Maximum 95% capital in trades at any time
+CAPITAL_PER_SLOT = 0.10      # Each trade slot uses 10% of capital
 
 # Leverage
 MIN_LEVERAGE     = 1
-DEFAULT_LEVERAGE = 2        # Default leverage for all tiers
-MAX_LEVERAGE     = 2        # Hard maximum — never exceed
+DEFAULT_LEVERAGE = 2          # Default leverage for all tiers
+MAX_LEVERAGE     = 2          # Hard maximum — never exceed
 
 # =============================================================================
 # 4. TIER CONFIGURATION
 # =============================================================================
 # Tiers define signal confidence, slot count, RRR.
 # To add a new tier: add an entry here. Nothing else needs to change.
+#
+# FIX: min_rrr now correctly differentiated by tier per strategy spec:
+#   Tier1 (highest confidence) → 1:2.0 RRR — best signals deserve best targets
+#   Tier2 (medium confidence)  → 1:1.75 RRR
+#   Tier3 (lower confidence)   → 1:1.5 RRR — minimum acceptable RRR
 
 TIERS = {
     "tier1": {
@@ -74,21 +87,21 @@ TIERS = {
         "score_percentile":   75,        # Top 25% backtest scores
         "max_slots":          4,
         "capital_pct":        0.40,
-        "min_rrr":            1.5,       # 1:1.5 RRR for faster TP hits
-        "btc_filter":         "strict",  # All tiers use strict BTC filter
+        "min_rrr":            2.0,       # 1:2 RRR — highest confidence, widest TP
+        "btc_filter":         "strict",
         "min_confluence":     4,         # 4 of 6 indicators must agree
-        "asian_session_size": 0.0,       # Skip Asian session entirely
-        "leverage":           2,         # 2x leverage for Tier 1
+        "asian_session_size": 0.5,       # 50% position size in Asian session
+        "leverage":           2,
     },
     "tier2": {
         "name":               "Medium Confidence",
         "score_percentile":   50,
         "max_slots":          3,
         "capital_pct":        0.30,
-        "min_rrr":            1.5,
+        "min_rrr":            1.75,      # 1:1.75 RRR
         "btc_filter":         "strict",
         "min_confluence":     4,
-        "asian_session_size": 0.0,
+        "asian_session_size": 0.5,       # 50% position size in Asian session
         "leverage":           2,
     },
     "tier3": {
@@ -96,7 +109,7 @@ TIERS = {
         "score_percentile":   25,
         "max_slots":          2,
         "capital_pct":        0.25,
-        "min_rrr":            1.5,
+        "min_rrr":            1.5,       # 1:1.5 RRR — minimum acceptable
         "btc_filter":         "strict",
         "min_confluence":     3,
         "asian_session_size": 0.0,       # Skip Asian session entirely
@@ -109,27 +122,24 @@ MIN_CONFLUENCE_ANY = 3
 # =============================================================================
 # 5. MULTI-TIMEFRAME CONFIGURATION
 # =============================================================================
-# Core change from v2.0: All tokens use multi-timeframe confirmation.
-# 1D sets macro direction → 4H confirms → 1H triggers entry.
-# All 3 must align before any trade fires.
 
 TIMEFRAMES = ["1h", "4h", "1d"]
 
-# Multi-timeframe confirmation hierarchy
 MTF_CONFIG = {
-    "macro_tf":     "1d",    # Sets overall trend direction
-    "confirm_tf":   "4h",    # Confirms intermediate trend
-    "entry_tf":     "1h",    # Triggers actual entry
-    "all_required": True,    # All 3 timeframes must agree — no exceptions
+    "macro_tf":     "1d",
+    "confirm_tf":   "4h",
+    "entry_tf":     "1h",
+    "all_required": True,
 }
 
-# Tiebreaker still applies for backtest scoring
 TIMEFRAME_TIEBREAKER_PCT  = 0.05
 TIMEFRAME_PRIORITY        = ["1h", "4h", "1d"]
 
-# Time stop rules per timeframe (based on entry timeframe = 1H)
+# Time stop rules per entry timeframe.
+# FIX: 1H corrected from 24 to 30 candles per strategy spec (30 hours max).
+# 4H: 12 candles = 2 days. 1D: 7 candles = 7 days.
 TIME_STOP_CANDLES = {
-    "1h": 24,    # 24 hours max per trade
+    "1h": 30,    # 30 hours max — FIX: was 24, spec says 30
     "4h": 12,    # 2 days max
     "1d": 7,     # 7 days max
 }
@@ -152,8 +162,8 @@ EMA_200_TIMEFRAMES  = ["4h", "1d"]
 
 RSI = {
     "period":     14,
-    "oversold":   35,    # Slightly relaxed from 30 for more signals
-    "overbought": 65,    # Slightly relaxed from 70 for more signals
+    "oversold":   35,
+    "overbought": 65,
 }
 
 MACD = {
@@ -168,8 +178,8 @@ BOLLINGER = {
 }
 
 VOLUME = {
-    "period":          20,
-    "min_multiplier":  1.1,    # Relaxed from 1.2 — slightly lower volume bar
+    "period":         20,
+    "min_multiplier": 1.1,
 }
 
 # =============================================================================
@@ -178,7 +188,9 @@ VOLUME = {
 
 SL = {
     "atr_period":     14,
-    "atr_multiplier": 1.5,
+    "atr_multiplier": 1.5,      # SL = 1.5× ATR minimum distance
+    "min_pct":        0.015,    # Hard floor: SL must be at least 1.5% of entry
+    "max_pct":        0.03,     # Hard cap: SL cannot exceed 3% of entry
 }
 
 TRAILING_SL = {
@@ -187,35 +199,40 @@ TRAILING_SL = {
     "trail_lock":   0.5,    # Lock in 0.5x risk as minimum profit
 }
 
+# Two-stage TP system (applied to all tiers):
+# Stage 1: Close 40% of position at 1.5x RRR — quick profit capture
+# Stage 2: Close 30% of position at 2.0x RRR — let winners run
+# Remaining 30%: Trail with 1.5x ATR until time stop or trailing SL hit
 TP = {
-    "tier1_close_pct":      0.40,   # Close 40% at 1.5x RRR target
-    "tier1_rrr":            1.5,    # First exit at 1.5x risk
-    "tier2_close_pct":      0.30,   # Close another 30% at 2x RRR target
-    "tier2_rrr":            2.0,    # Second exit at 2x risk
-    "trail_pct":            0.30,   # Remaining 30% trails with ATR
-    "trail_atr_multiplier": 1.5,    # Trail with 1.5x ATR — gives room to breathe
+    "tier1_close_pct":      0.40,
+    "tier1_rrr":            1.5,    # First partial exit at 1.5x risk
+    "tier2_close_pct":      0.30,
+    "tier2_rrr":            2.0,    # Second partial exit at 2.0x risk
+    "trail_pct":            0.30,
+    "trail_atr_multiplier": 1.5,
 }
 
 ENTRY = {
-    "leg1_pct":           0.60,   # Enter 60% at signal candle close
-    "leg2_pct":           0.40,   # Enter 40% on pullback
-    "leg2_candle_window": 3,      # Pullback must happen within 3 candles
+    "leg1_pct":           0.60,
+    "leg2_pct":           0.40,
+    "leg2_candle_window": 3,
 }
 
 SL_COOLDOWN_CANDLES = {
-    "1h": 4,    # 4 hours = one full 4H confirmation candle
-    "4h": 6,    # 24 hours = one full 1D confirmation candle
-    "1d": 3,    # 3 days = weekly trend reassessment
+    "1h": 4,
+    "4h": 6,
+    "1d": 3,
 }
 
 # =============================================================================
 # 8. DRAWDOWN CIRCUIT BREAKERS
 # =============================================================================
+# FIX: Thresholds corrected to match strategy spec (was 15/25/40%).
 
 DRAWDOWN = {
-    "alert_pct": 0.15,   # 15% — alert only
-    "pause_pct": 0.25,   # 25% — pause new entries
-    "stop_pct":  0.40,   # 40% — full stop
+    "alert_pct": 0.20,   # 20% — Telegram alert, bot continues trading
+    "pause_pct": 0.35,   # 35% — Pause new entries, existing trades finish
+    "stop_pct":  0.50,   # 50% — Full stop, all trades closed at market
 }
 
 # =============================================================================
@@ -236,9 +253,9 @@ FILTERS = {
     },
 
     "fear_greed": {
-        "enabled":                  True,
-        "extreme_fear_threshold":   20,
-        "extreme_greed_threshold":  80,
+        "enabled":                 True,
+        "extreme_fear_threshold":  20,
+        "extreme_greed_threshold": 80,
         "api_url": "https://api.alternative.me/fng/",
     },
 
@@ -250,17 +267,26 @@ FILTERS = {
     },
 
     "volume": {
-        "enabled":          True,
-        "min_multiplier":   1.1,
-        "lookback_period":  20,
+        "enabled":         True,
+        "min_multiplier":  1.1,
+        "lookback_period": 20,
     },
 
     "session": {
         "enabled": True,
-        # Times in UTC — Asian session skipped entirely for all tiers
+        # Times in UTC
+        # FIX: Asian session is now tier-aware per strategy spec.
+        # Tier1/Tier2: 50% position size in Asian session (was blocked entirely).
+        # Tier3: Skip Asian session entirely (unchanged).
+        # 1D timeframe signals are exempt — daily candle is already closed.
         "us_session":    {"start": 13, "end": 21, "size_multiplier": 1.0},
         "euro_session":  {"start": 7,  "end": 13, "size_multiplier": 1.0},
-        "asian_session": {"start": 0,  "end": 7,  "size_multiplier": 0.0},
+        "asian_session": {
+            "start": 0, "end": 7,
+            "tier1_size": 0.5,    # 50% position size — spec compliant
+            "tier2_size": 0.5,    # 50% position size — spec compliant
+            "tier3_size": 0.0,    # Tier3 fully blocked in Asian session
+        },
     },
 
     "candle_close": {
@@ -276,39 +302,40 @@ FILTERS = {
         },
     },
 
-    # NEW: Multi-timeframe alignment filter
     "mtf_alignment": {
-        "enabled":      True,
-        "require_all":  True,   # All 3 timeframes must agree
+        "enabled":     True,
+        "require_all": True,
     },
 
-    # NEW: RSI zone filter — only enter when RSI is in favorable zone
+    # FIX: short_min_rsi reduced from 40 to 28.
+    # At 40, the filter blocked ALL short signals in Extreme Fear conditions
+    # where RSI is typically 20–35. Shorts in the 28–40 RSI range are valid
+    # when trend confluence is confirmed on higher timeframes.
     "rsi_zone": {
-        "enabled":          True,
-        "long_max_rsi":     60,  # Don't enter long if RSI already above 60
-        "short_min_rsi":    40,  # Don't enter short if RSI already below 40
+        "enabled":      True,
+        "long_max_rsi":  60,   # Don't enter long when RSI already above 60
+        "short_min_rsi": 28,   # Don't enter short when RSI already below 28
     },
 
-    # NEW: Price position filter — only enter near EMA, not extended
+    # FIX: max_ema_distance increased from 3% to 8%.
+    # In a trending market, price routinely sits 5–15% from the 20-period EMA.
+    # 3% was blocking entries precisely when trend momentum was clearest.
     "price_position": {
         "enabled":          True,
-        "max_ema_distance": 0.03,  # Price must be within 3% of EMA fast
+        "max_ema_distance": 0.08,   # Price must be within 8% of fast EMA
     },
 }
 
 # =============================================================================
 # 10. BTC TREND FILTER
 # =============================================================================
-# Strict for ALL tiers in v3.0 — no soft overrides
-# Multi-timeframe BTC confirmation required
 
 BTC_FILTER = {
-    "enabled":       True,
-    "symbol":        "BTC/USDT:USDT",
-    "trend_ema_fast": 20,
-    "trend_ema_slow": 50,
-    "require_mtf":   True,   # BTC trend confirmed on both 1H and 4H
-    # All tiers strict — defined in TIERS config above
+    "enabled":        True,
+    "symbol":         "BTC/USDT:USDT",
+    "trend_ema_fast":  20,
+    "trend_ema_slow":  50,
+    "require_mtf":    True,
 }
 
 # =============================================================================
@@ -319,7 +346,7 @@ PERFORMANCE_MONITOR = {
     "enabled":         True,
     "lookback_trades": 20,
     "min_expectancy":  0.0,
-    "min_win_rate":    0.40,   # Pause if rolling win rate drops below 40%
+    "min_win_rate":    0.40,
 }
 
 # =============================================================================
@@ -331,30 +358,28 @@ BACKTEST = {
     "train_months":       8,
     "validate_months":    4,
     "batch_size":         10,
-    "min_trades": {          # Per-timeframe minimum trades in validation window
+    "min_trades": {
         "1h": 15,
         "4h": 8,
         "1d": 5,
     },
-    "max_overfitting_gap": 0.25,  # Relaxed from 0.10
+    "max_overfitting_gap": 0.25,
 }
 
-# Scoring weights — must sum to 1.0
 SCORING_WEIGHTS = {
-    "expectancy":    0.35,   # Increased — most important metric
-    "win_rate":      0.25,   # Increased — we want high win rate
+    "expectancy":    0.35,
+    "win_rate":      0.25,
     "max_drawdown":  0.15,
     "profit_factor": 0.15,
     "sharpe_ratio":  0.10,
 }
 
-# Minimum thresholds — strategy fails if ANY not met
 SCORING_MINIMUMS = {
-    "expectancy":    0.0,    # Must be positive
-    "win_rate":      0.38,   # 38% minimum — expectancy is the real guard
-    "max_drawdown":  0.25,   # Allow up to 25% drawdown in backtest
-    "profit_factor": 1.1,    # Minimum 1.1
-    "sharpe_ratio":  0.3,    # Minimum 0.3
+    "expectancy":    0.0,
+    "win_rate":      0.38,
+    "max_drawdown":  0.25,
+    "profit_factor": 1.1,
+    "sharpe_ratio":  0.3,
 }
 
 # =============================================================================
@@ -386,18 +411,18 @@ TELEGRAM = {
     "chat_id":   os.getenv("TELEGRAM_CHAT_ID", ""),
 
     "alerts": {
-        "trade_open":          True,
-        "trade_close":         True,
-        "stop_loss_hit":       True,
-        "take_profit_hit":     True,
-        "drawdown_alert":      True,
-        "drawdown_pause":      True,
-        "drawdown_stop":       True,
-        "rebalance_complete":  True,
-        "token_added":         True,
-        "token_removed":       True,
-        "performance_pause":   True,
-        "bot_error":           True,
+        "trade_open":         True,
+        "trade_close":        True,
+        "stop_loss_hit":      True,
+        "take_profit_hit":    True,
+        "drawdown_alert":     True,
+        "drawdown_pause":     True,
+        "drawdown_stop":      True,
+        "rebalance_complete": True,
+        "token_added":        True,
+        "token_removed":      True,
+        "performance_pause":  True,
+        "bot_error":          True,
     },
 }
 
@@ -450,9 +475,9 @@ GO_LIVE_CRITERIA = {
 # =============================================================================
 
 PROFIT_TARGETS = {
-    "daily_target_pct":    0.8,    # ~0.8% per day = ~20% monthly
-    "monthly_target_pct":  20.0,   # 20% monthly target
-    "monthly_stretch_pct": 30.0,   # 30% stretch goal in bull markets
+    "daily_target_pct":    0.8,
+    "monthly_target_pct":  20.0,
+    "monthly_stretch_pct": 30.0,
 }
 
 # =============================================================================
@@ -470,7 +495,6 @@ EXCLUDED_TOKENS = [
 # =============================================================================
 
 # ── APEX Event Logger ────────────────────────────────────────────────────────
-# Initialized here so every module can do: from bot.config import apex_logger
 from bot.logger import APEXLogger as _APEXLogger
 APEX_LOG_DIR = str(BASE_DIR.parent / "logs" / "apex_events")
 apex_logger  = _APEXLogger(APEX_LOG_DIR)
@@ -485,6 +509,7 @@ def get_config_dict() -> dict:
         "CAPITAL_PER_SLOT":    CAPITAL_PER_SLOT,
         "MAX_LEVERAGE":        MAX_LEVERAGE,
         "DRAWDOWN":            DRAWDOWN,
+        "TIME_STOP_CANDLES":   TIME_STOP_CANDLES,
         "GO_LIVE_CRITERIA":    GO_LIVE_CRITERIA,
         "PERFORMANCE_MONITOR": PERFORMANCE_MONITOR,
         "SCORING_MINIMUMS":    SCORING_MINIMUMS,

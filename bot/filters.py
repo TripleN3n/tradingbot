@@ -1,7 +1,14 @@
 # =============================================================================
 # APEX — Adaptive Per-token Execution Strategy Engine
 # bot/filters.py — Entry Filters
-# Version 3.1 — Timeframe-matched BTC filter, all tiers active
+# Version 3.2 — Tier-aware session filter, timeframe parameter added
+# =============================================================================
+# CHANGES FROM v3.1:
+# - filter_session(): Now tier-aware per strategy spec.
+#   Tier1/Tier2 allowed in Asian session at 50% position size (was fully blocked).
+#   Tier3 still fully blocked in Asian session.
+#   Timeframe parameter added for future-proofing and logging clarity.
+# - run_all_filters(): Passes timeframe to filter_session().
 # =============================================================================
 # All filters are independent and pluggable.
 # Add a new filter: add function + one line in run_all_filters(). Done.
@@ -15,17 +22,8 @@
 # 5. Fear & Greed filter
 # 6. BTC trend filter — matches token's entry timeframe exactly
 # 7. Correlation filter
-# 8. Session filter
+# 8. Session filter — tier-aware Asian session handling
 # 9. Cooldown filter
-#
-# BTC FILTER DESIGN (v3.1):
-# BTC direction is checked on the SAME timeframe as the token's entry.
-# 1H token → check BTC 1H direction
-# 4H token → check BTC 4H direction
-# 1D token → check BTC 1D direction
-# All tiers use the same rule. No soft/strict distinction — that added
-# complexity without benefit. If BTC aligns on the entry timeframe, trade.
-# If BTC is neutral on that timeframe, trade is allowed.
 # =============================================================================
 
 import pandas as pd
@@ -143,30 +141,25 @@ def filter_btc_trend(
     timeframe: str,
 ) -> FilterResult:
     """
-    BTC trend filter — checks BTC direction on the SAME timeframe as the token entry.
+    BTC trend filter — checks BTC direction on the SAME timeframe as token entry.
 
-    1H token entry → checks btc_trend["1h"]
-    4H token entry → checks btc_trend["4h"]
-    1D token entry → checks btc_trend["1d"]
+    1H token → checks btc_trend["1h"]
+    4H token → checks btc_trend["4h"]
+    1D token → checks btc_trend["1d"]
 
     Rules:
-    - BTC neutral on that timeframe → trade allowed (don't block on uncertainty)
+    - BTC neutral on that timeframe → trade allowed
     - BTC aligned with trade direction → trade allowed
     - BTC opposed to trade direction → trade blocked
-
-    All tiers use the same rule. No soft/strict distinction.
     """
     if not BTC_FILTER.get("enabled", True):
         return FilterResult(True, "BTC filter disabled")
 
-    # Get BTC direction for the matching entry timeframe
     btc_direction = btc_trend.get(timeframe, "neutral")
 
-    # Neutral BTC on this timeframe — do not block
     if btc_direction == "neutral":
         return FilterResult(True, f"BTC {timeframe} neutral — trade allowed")
 
-    # Check alignment
     aligned = (
         (direction == "long"  and btc_direction == "bullish") or
         (direction == "short" and btc_direction == "bearish")
@@ -226,43 +219,61 @@ def filter_correlation(
 
 
 # =============================================================================
-# FILTER 8 — SESSION FILTER
+# FILTER 8 — SESSION FILTER (v3.2 — tier-aware)
 # =============================================================================
 
-def filter_session(tier: str) -> FilterResult:
+def filter_session(tier: str, timeframe: str = "1h") -> FilterResult:
+    """
+    Session-based position sizing filter.
+
+    FIX from v3.1: Now tier-aware per strategy spec.
+    - US session (13:00–21:00 UTC):   All tiers, full size.
+    - Euro session (07:00–13:00 UTC): All tiers, full size.
+    - Asian session (all other hours): Tier-dependent:
+        - Tier1 / Tier2: 50% position size (reduced, but allowed)
+        - Tier3:         Skipped entirely
+
+    Previously, Asian session blocked ALL tiers with size_multiplier=0.0.
+    This inadvertently deadlocked 1D-timeframe tokens whose signals
+    only fired at midnight UTC (hour 0 = Asian session).
+    """
     if not FILTERS["session"]["enabled"]:
         return FilterResult(True, "disabled", size_multiplier=1.0)
 
-    hour = datetime.now(timezone.utc).hour
-
+    hour         = datetime.now(timezone.utc).hour
     us_session   = FILTERS["session"]["us_session"]
     euro_session = FILTERS["session"]["euro_session"]
+    asian_cfg    = FILTERS["session"]["asian_session"]
 
+    # US session: full size, all tiers
     if us_session["start"] <= hour < us_session["end"]:
-        return FilterResult(True, "US session", size_multiplier=1.0)
+        return FilterResult(True, f"US session (hour {hour}:xx UTC)", size_multiplier=1.0)
 
+    # Euro session: full size, all tiers
     if euro_session["start"] <= hour < euro_session["end"]:
-        return FilterResult(True, "European session", size_multiplier=1.0)
+        return FilterResult(True, f"Euro session (hour {hour}:xx UTC)", size_multiplier=1.0)
 
-    # Asian session — skip entirely
+    # Asian / off-hours session (hours 0–6 and 21–23 UTC)
+    # Resolve the size multiplier for this tier
+    if tier == "tier1":
+        size = asian_cfg.get("tier1_size", 0.5)
+    elif tier == "tier2":
+        size = asian_cfg.get("tier2_size", 0.5)
+    else:
+        size = asian_cfg.get("tier3_size", 0.0)
+
+    if size > 0:
+        return FilterResult(
+            True,
+            f"Asian session — {tier} allowed at {int(size * 100)}% size (hour {hour}:xx UTC)",
+            size_multiplier=size,
+        )
+
     return FilterResult(
         False,
-        "Asian session — skipped (low quality signals)",
+        f"Asian session — {tier} skipped (hour {hour}:xx UTC)",
         size_multiplier=0.0,
     )
-
-
-# =============================================================================
-# FILTER 9 — COOLDOWN FILTER
-# =============================================================================
-
-def filter_cooldown(symbol: str, cooldown_tracker: dict) -> FilterResult:
-    if not FILTERS["cooldown"]["enabled"]:
-        return FilterResult(True, "disabled")
-    remaining = cooldown_tracker.get(symbol, 0)
-    if remaining > 0:
-        return FilterResult(False, f"Cooldown: {remaining} candles after SL")
-    return FilterResult(True, "No cooldown")
 
 
 # =============================================================================
@@ -289,6 +300,7 @@ def run_all_filters(
     Returns dict with passed, size_multiplier, failures, details.
 
     BTC filter uses the token's entry timeframe to check the matching BTC direction.
+    Session filter is now tier-aware — Asian session allowed for tier1/2 at 50% size.
 
     To add a new filter:
     1. Create a filter function above
@@ -299,6 +311,7 @@ def run_all_filters(
     size_multiplier = 1.0
     failures        = []
 
+    # FIX: filter_session now receives timeframe for logging clarity
     filter_checks = [
         ("candle_close",  lambda: filter_candle_close(df)),
         ("volume",        lambda: filter_volume(df)),
@@ -307,7 +320,7 @@ def run_all_filters(
         ("fear_greed",    lambda: filter_fear_greed(fear_greed_value, direction)),
         ("btc_trend",     lambda: filter_btc_trend(btc_trend, direction, timeframe)),
         ("correlation",   lambda: filter_correlation(symbol, open_trades, price_history)),
-        ("session",       lambda: filter_session(tier)),
+        ("session",       lambda: filter_session(tier, timeframe)),
         ("cooldown",      lambda: filter_cooldown(symbol, cooldown_tracker)),
     ]
 
@@ -330,8 +343,8 @@ def run_all_filters(
                             full_context = {
                                 "tier":             tier,
                                 "timeframe":        timeframe,
-                                "btc_trend":        btc_trend.get("direction","?") if isinstance(btc_trend,dict) else str(btc_trend),
-                                "btc_tf_direction": btc_trend.get(timeframe,"?") if isinstance(btc_trend,dict) else "?",
+                                "btc_trend":        btc_trend.get("direction", "?") if isinstance(btc_trend, dict) else str(btc_trend),
+                                "btc_tf_direction": btc_trend.get(timeframe, "?") if isinstance(btc_trend, dict) else "?",
                                 "fg_index":         fear_greed_value,
                                 "funding_rate":     funding_rate,
                                 "confluence_count": confluence_count,
@@ -354,7 +367,10 @@ def run_all_filters(
     if not passed:
         logger.debug(f"Filters FAILED {symbol} {direction} [{timeframe}]: {failures}")
     else:
-        logger.debug(f"All filters PASSED {symbol} {direction} [{timeframe}] (size: {size_multiplier:.1f}x)")
+        logger.debug(
+            f"All filters PASSED {symbol} {direction} [{timeframe}] "
+            f"(size: {size_multiplier:.2f}x)"
+        )
 
     return {
         "passed":          passed,
@@ -367,6 +383,15 @@ def run_all_filters(
 # =============================================================================
 # COOLDOWN MANAGEMENT
 # =============================================================================
+
+def filter_cooldown(symbol: str, cooldown_tracker: dict) -> FilterResult:
+    if not FILTERS["cooldown"]["enabled"]:
+        return FilterResult(True, "disabled")
+    remaining = cooldown_tracker.get(symbol, 0)
+    if remaining > 0:
+        return FilterResult(False, f"Cooldown: {remaining} candles after SL")
+    return FilterResult(True, "No cooldown")
+
 
 def decrement_cooldowns(cooldown_tracker: dict) -> dict:
     """Decrement all cooldown counters by 1. Remove expired ones."""

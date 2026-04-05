@@ -1,20 +1,26 @@
 # =============================================================================
 # APEX — Adaptive Per-token Execution Strategy Engine
 # bot/signal_engine.py — Live Signal Generation Engine
-# Version 3.1 — Per-token timeframe entries
+# Version 3.2 — Timeframe gating fix, SL floor added
 # =============================================================================
-# CORE CHANGE FROM v3.0:
-# Each token now enters on its ASSIGNED timeframe from apex.db — not hardcoded 1H.
-# - 1H token: 1D+4H confirm direction → 1H triggers entry
-# - 4H token: 1D confirms direction   → 4H triggers entry
-# - 1D token: 1D is the entry         → 1D triggers entry directly
+# CHANGES FROM v3.1:
 #
-# Signal generation is timeframe-gated:
-# - 1H tokens: every cycle (new 1H candle closes each cycle)
-# - 4H tokens: cycles at UTC hours 0, 4, 8, 12, 16, 20
-# - 1D tokens: cycle at UTC hour 0 only
+# should_generate_signal():
+#   Previously gated 1D signals to UTC hour 0 only. This caused a complete
+#   deadlock: hour 0 is Asian session, and the session filter blocked Asian
+#   session. Result: 1D tokens could NEVER open a trade.
+#   FIX: Returns True for all timeframes every cycle. The OHLCV data already
+#   contains only closed candles, so signals are always based on the correct
+#   most-recently-closed candle regardless of when the cycle runs.
+#   Duplicate entry prevention is handled by the open_symbols check.
 #
-# BTC filter is timeframe-matched in filters.py.
+# calculate_sl_tp_live():
+#   Previously had a 3% hard CAP on SL distance but no minimum FLOOR.
+#   When ATR was small, SLs as tight as 0.52% were produced — well within
+#   normal 1H candle noise, causing guaranteed stop-outs on minor wicks.
+#   FIX: Added 1.5% minimum SL floor. Combined with 3% cap, SL distance is
+#   now bounded between 1.5% and 3% of entry price.
+#   Configuration: SL["min_pct"] = 0.015, SL["max_pct"] = 0.03 in config.py.
 # =============================================================================
 
 import pandas as pd
@@ -145,7 +151,7 @@ def get_timeframe_direction(df: pd.DataFrame) -> Optional[str]:
 def get_mtf_direction(df_higher: pd.DataFrame, df_confirm: pd.DataFrame) -> Optional[str]:
     """
     Get direction from two timeframes — both must agree.
-    Used for 1H entries (1D+4H must agree).
+    Used for 1H entries (1D + 4H must agree).
     """
     if not MTF_CONFIG.get("all_required", True):
         return "any"
@@ -178,17 +184,11 @@ def get_mtf_direction_for_entry(
     Returns the required direction, or None if confirmation fails.
     """
     if timeframe == "1h":
-        # Both 1D and 4H must agree before triggering 1H entry
         return get_mtf_direction(df_1d, df_4h)
-
     elif timeframe == "4h":
-        # 1D confirms the 4H entry
         return get_timeframe_direction(df_1d)
-
     elif timeframe == "1d":
-        # 1D is the entry timeframe — direction is the candle's own trend
         return get_timeframe_direction(df_1d)
-
     return None
 
 
@@ -209,25 +209,23 @@ def get_entry_df(
 
 def should_generate_signal(timeframe: str) -> bool:
     """
-    Gate signal generation to when the assigned timeframe candle just closed.
+    Determine whether signal generation should run for this timeframe this cycle.
 
-    The bot runs every hour. We only want to evaluate signals when a new candle
-    of the token's entry timeframe has just closed — not on every cycle.
+    FIX from v3.1: Previously gated 1D signals to UTC hour 0 only, which
+    conflicted with the session filter blocking Asian session (hour 0).
+    This created a permanent deadlock for 1D-assigned tokens — they could
+    never execute a trade.
 
-    1H tokens: every cycle (new 1H candle closes every hour)
-    4H tokens: cycles at UTC hours 0, 4, 8, 12, 16, 20
-    1D tokens: cycle at UTC hour 0 only (daily candle closes at midnight UTC)
+    Now returns True for all timeframes on every cycle. This is safe because:
+    - OHLCV data already only contains closed candles (fetch_ohlcv drops the
+      last forming candle), so signals are always based on correct data.
+    - Duplicate entry prevention is handled by open_symbols checks downstream.
+    - The session filter controls when entries are actually allowed to execute.
+
+    The previous optimisation (avoiding computation on non-candle-close cycles)
+    is sacrificed in favour of correctness. The added overhead is negligible.
     """
-    hour = datetime.now(timezone.utc).hour
-
-    if timeframe == "1h":
-        return True
-    elif timeframe == "4h":
-        return hour % 4 == 0
-    elif timeframe == "1d":
-        return hour == 0
-
-    return True  # Unknown timeframe — allow by default
+    return True
 
 
 # =============================================================================
@@ -244,7 +242,6 @@ def check_confluence_mtf(
     Check confluence on the entry timeframe dataframe.
     Signal must match required_direction from MTF confirmation.
 
-    Works on any timeframe df (1H, 4H, or 1D).
     Returns (direction, confluence_count) or (None, 0).
     """
     if df is None or df.empty:
@@ -266,7 +263,6 @@ def check_confluence_mtf(
 
     direction = ema_sig
 
-    # Must match the required MTF direction
     if required_direction != "any" and direction != required_direction:
         return None, 0
 
@@ -283,7 +279,14 @@ def check_confluence_mtf(
 # =============================================================================
 
 def passes_rsi_zone_live(df: pd.DataFrame, direction: str) -> bool:
-    """Don't enter longs when RSI already high, shorts when already low."""
+    """
+    Gate entries based on RSI zone.
+    Prevents entering longs when RSI is already overbought,
+    or shorts when RSI is already deeply oversold.
+
+    FIX: short_min_rsi reduced from 40 to 28 in config.py.
+    Previously blocked ALL short signals in Extreme Fear (RSI 20–35).
+    """
     rsi_config = FILTERS.get("rsi_zone", {})
     if not rsi_config.get("enabled", True):
         return True
@@ -293,12 +296,19 @@ def passes_rsi_zone_live(df: pd.DataFrame, direction: str) -> bool:
     if pd.isna(rsi):
         return True
     if direction == "long"  and rsi > rsi_config.get("long_max_rsi", 60):  return False
-    if direction == "short" and rsi < rsi_config.get("short_min_rsi", 40): return False
+    if direction == "short" and rsi < rsi_config.get("short_min_rsi", 28): return False
     return True
 
 
 def passes_price_position_live(df: pd.DataFrame, direction: str) -> bool:
-    """Only enter when price is near EMA — not extended."""
+    """
+    Gate entries based on price distance from fast EMA.
+    Prevents chasing extended moves.
+
+    FIX: max_ema_distance increased from 3% to 8% in config.py.
+    3% was too tight — blocked entries in trending markets where price
+    routinely sits 5–15% from the 20-period EMA.
+    """
     pp_config = FILTERS.get("price_position", {})
     if not pp_config.get("enabled", True):
         return True
@@ -310,7 +320,7 @@ def passes_price_position_live(df: pd.DataFrame, direction: str) -> bool:
     if pd.isna(ema_fast) or ema_fast == 0:
         return True
     distance = abs(close - ema_fast) / ema_fast
-    return distance <= pp_config.get("max_ema_distance", 0.03)
+    return distance <= pp_config.get("max_ema_distance", 0.08)
 
 
 # =============================================================================
@@ -322,7 +332,19 @@ def calculate_sl_tp_live(
     direction: str,
     tier_rrr: float,
 ) -> Optional[dict]:
-    """Calculate SL and TP from the entry timeframe data using ATR + structure."""
+    """
+    Calculate SL and TP from the entry timeframe data using ATR + structure.
+
+    SL placement logic:
+    1. ATR-based minimum: SL = 1.5× ATR (ensures minimum breathing room)
+    2. Structure-based: SL just beyond nearest S/R (10 candle lookback)
+    3. Take the wider of ATR vs structure — never compromise SL tightness
+    4. Apply floor: SL distance must be at least SL["min_pct"] of entry (1.5%)
+       FIX: This floor was missing. SLs as tight as 0.52% were hitting on noise.
+    5. Apply cap: SL distance cannot exceed SL["max_pct"] of entry (3%)
+
+    The floor and cap together bound SL distance between 1.5% and 3%.
+    """
     if df is None or df.empty:
         return None
 
@@ -349,10 +371,24 @@ def calculate_sl_tp_live(
         take_profit    = entry - sl_dist * tier_rrr
         if take_profit >= entry: return None
 
-    if sl_dist <= 0: return None
+    if sl_dist <= 0:
+        return None
 
-    # Hard cap: SL distance must not exceed 3% of entry price
-    max_sl_dist = entry * 0.03
+    # --- FLOOR: SL distance must be at least 1.5% of entry ---
+    # FIX: Previously absent. Prevented noise-level SLs (0.52–0.94%)
+    # that were guaranteed to hit on normal candle wicks.
+    min_sl_dist = entry * SL.get("min_pct", 0.015)
+    if sl_dist < min_sl_dist:
+        sl_dist = min_sl_dist
+        if direction == "long":
+            stop_loss   = entry - sl_dist
+            take_profit = entry + sl_dist * tier_rrr
+        else:
+            stop_loss   = entry + sl_dist
+            take_profit = entry - sl_dist * tier_rrr
+
+    # --- CAP: SL distance cannot exceed 3% of entry ---
+    max_sl_dist = entry * SL.get("max_pct", 0.03)
     if sl_dist > max_sl_dist:
         sl_dist = max_sl_dist
         if direction == "long":
@@ -362,8 +398,10 @@ def calculate_sl_tp_live(
             stop_loss   = entry + sl_dist
             take_profit = entry - sl_dist * tier_rrr
 
+    # Final RRR check — must still meet tier minimum after adjustments
     actual_rrr = abs(take_profit - entry) / sl_dist
-    if actual_rrr < tier_rrr: return None
+    if actual_rrr < tier_rrr:
+        return None
 
     return {
         "entry":       entry,
@@ -426,7 +464,8 @@ def generate_signal_for_token(
     comp_score = strategy["composite_score"]
     timeframe  = strategy.get("timeframe", "1h")
 
-    # STEP 1 — Check if this timeframe's candle just closed this cycle
+    # STEP 1 — Check if this timeframe's candle should be evaluated this cycle.
+    # FIX: Returns True for all timeframes now. See should_generate_signal() docstring.
     if not should_generate_signal(timeframe):
         logger.debug(f"{symbol}: {timeframe} candle not due this cycle — skipping")
         return None
@@ -517,10 +556,10 @@ def generate_signal_for_token(
     }
 
     logger.info(
-        f"Signal: {symbol.replace('/USDT:USDT','')} {direction.upper()} | "
+        f"Signal: {symbol.replace('/USDT:USDT', '')} {direction.upper()} | "
         f"{tier} | {timeframe} | MTF:{mtf_direction} | "
         f"Score:{signal_score:.4f} | Conf:{confluence_count} | "
-        f"RRR:{sl_tp['rrr']:.2f}"
+        f"RRR:{sl_tp['rrr']:.2f} | SL:{sl_tp['sl_distance'] / sl_tp['entry'] * 100:.2f}%"
     )
 
     return signal
@@ -536,8 +575,7 @@ def generate_signals(
     """
     Generate signals for all active tokens.
     Each token uses its assigned timeframe from apex.db.
-    Signals are gated — only generated when the assigned timeframe candle closed.
-    Returns list sorted by signal_score descending (Tier1 first, then Tier2, Tier3).
+    Returns list sorted by signal_score descending (Tier1 first).
     """
     ohlcv_data   = cycle_data.get("ohlcv", {})
     signals      = []
@@ -633,13 +671,12 @@ def generate_signals(
             logger.error(f"Signal error {symbol}: {e}", exc_info=True)
 
     # Sort by signal_score descending — Tier1 naturally floats to top
-    # due to tier_bonus in score_signal()
     signals.sort(key=lambda x: x["signal_score"], reverse=True)
 
     if signals:
         logger.info(
             f"Generated {len(signals)} signal(s): "
-            f"{[s['symbol'].replace('/USDT:USDT','') + ' ' + s['direction'] + ' [' + s['timeframe'] + ']' for s in signals]}"
+            f"{[s['symbol'].replace('/USDT:USDT', '') + ' ' + s['direction'] + ' [' + s['timeframe'] + ']' for s in signals]}"
         )
     else:
         logger.info("No signals this cycle")

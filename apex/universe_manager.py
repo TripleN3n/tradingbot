@@ -66,7 +66,7 @@ def get_universe_snapshot(conn: sqlite3.Connection) -> dict:
     """
     c = conn.cursor()
     c.execute("""
-        SELECT symbol, market_cap_rank, daily_volume, is_active
+        SELECT symbol, market_cap_rank, daily_volume_usd, is_active
         FROM universe
         ORDER BY market_cap_rank ASC
     """)
@@ -310,7 +310,7 @@ def get_active_universe(conn: sqlite3.Connection) -> list[dict]:
     """
     c = conn.cursor()
     c.execute("""
-        SELECT symbol, base_asset, market_cap_rank, daily_volume
+        SELECT symbol, base_asset, market_cap_rank, daily_volume_usd
         FROM universe
         WHERE is_active = 1
         ORDER BY market_cap_rank ASC

@@ -1,25 +1,32 @@
 # =============================================================================
 # APEX — Adaptive Per-token Execution Strategy Engine
 # bot/trade_manager.py — Trade Execution & Management
+# Version 3.2 — Partial TP PnL accounting fixed
+# =============================================================================
+# CHANGES FROM v3.1:
+#
+# init_trades_db():
+#   Added partial_pnl_usdt column (REAL DEFAULT 0) via safe ALTER TABLE.
+#   Stores accumulated PnL from partial TP closes (tier1 + tier2 exits).
+#
+# check_primary_tp():
+#   After each partial TP close, now:
+#   1. Accumulates PnL to partial_pnl_usdt column in trades table.
+#   2. Immediately updates capital via update_capital().
+#   Previously, partial TP profits were calculated but never recorded
+#   to the database or reflected in capital. Capital was understated
+#   by the full amount of every partial TP profit taken.
+#
+# close_trade():
+#   Total PnL now = partial_pnl_usdt (from all prior partial TPs)
+#                 + remaining_pnl (from the final close quantity).
+#   pnl_pct reflects the true total return on position_size_usdt.
+#   Previously only the remaining quantity PnL was recorded.
 # =============================================================================
 # RESPONSIBILITY:
 # Handles all trade lifecycle operations:
 # opening trades, managing trailing SL/TP, closing trades.
 # Single source of truth for all trade state in trades.db.
-#
-# WHAT THIS FILE DOES:
-# - Opens trades with two-leg scaled entry (60% + 40%)
-# - Manages trailing SL (breakeven at 1x risk, trail at 1.5x)
-# - Manages partial TP (close 70% at fixed TP, trail 30%)
-# - Applies time stops per timeframe
-# - Closes trades at SL, TP, time stop, or manual close
-# - Records all trades to SQLite database
-# - Calculates PnL accurately for paper and live trading
-#
-# WHAT THIS FILE DOES NOT DO:
-# - Does not generate signals (that's signal_engine.py)
-# - Does not manage capital slots (that's capital_manager.py)
-# - Does not monitor drawdown (that's risk_manager.py)
 # =============================================================================
 
 import sqlite3
@@ -89,6 +96,10 @@ def init_trades_db(conn: sqlite3.Connection):
             pnl_usdt            REAL,
             pnl_pct             REAL,
 
+            -- Partial TP accumulator (FIX: new column)
+            -- Stores sum of PnL from all partial TP exits before final close.
+            partial_pnl_usdt    REAL DEFAULT 0,
+
             -- Metadata
             signal_score        REAL,
             confluence_count    INTEGER,
@@ -114,6 +125,16 @@ def init_trades_db(conn: sqlite3.Connection):
     """)
 
     conn.commit()
+
+    # Safe migration: add partial_pnl_usdt to existing tables that predate this column.
+    # ALTER TABLE ADD COLUMN is idempotent-safe via try/except — fails silently if exists.
+    try:
+        c.execute("ALTER TABLE trades ADD COLUMN partial_pnl_usdt REAL DEFAULT 0")
+        conn.commit()
+        logger.info("Trades DB: added partial_pnl_usdt column (schema migration)")
+    except Exception:
+        pass  # Column already exists — no action needed
+
     logger.info("Trades database initialized")
 
 
@@ -191,14 +212,11 @@ def _place_order(
     """
     Place an order on the exchange.
     In paper trading mode, simulates the order fill at current price.
-
-    Returns order dict with fill price, or None on failure.
     """
     if PAPER_TRADING:
-        # Simulate market fill at signal price
         return {
-            "id":    f"paper_{datetime.now(timezone.utc).timestamp()}",
-            "price": price,
+            "id":     f"paper_{datetime.now(timezone.utc).timestamp()}",
+            "price":  price,
             "filled": quantity,
             "status": "closed",
         }
@@ -239,9 +257,9 @@ def open_trade(
     """
     Open a new trade using two-leg scaled entry.
 
-    Leg 1: Enter 60% of position at signal candle close price
-    Leg 2: Enter remaining 40% on pullback to EMA within 3 candles
-           If no pullback → enter at original price on next candle
+    Leg 1: Enter 60% of position at signal candle close price.
+    Leg 2: Enter remaining 40% on pullback to EMA within 3 candles.
+           If no pullback → enter at original price on next candle.
 
     Returns trade_id if successful, None on failure.
     """
@@ -261,7 +279,6 @@ def open_trade(
     signal_score   = signal.get("signal_score", 0)
     confluence     = signal.get("confluence_count", 0)
 
-    # Set leverage
     _set_leverage(symbol, leverage)
 
     # Leg 1 — 60% of position
@@ -275,7 +292,6 @@ def open_trade(
     fill_price_leg1 = order1.get("price", entry_price)
     now             = datetime.now(timezone.utc).isoformat()
 
-    # Insert trade record
     c = conn.cursor()
     c.execute("""
         INSERT INTO trades (
@@ -285,6 +301,7 @@ def open_trade(
             position_size_usdt, leverage,
             stop_loss, take_profit, sl_distance, atr_at_entry, rrr,
             trailing_sl, at_breakeven,
+            partial_pnl_usdt,
             signal_score, confluence_count,
             entry_time, leg2_pending, leg2_candles_waited
         ) VALUES (
@@ -294,6 +311,7 @@ def open_trade(
             ?, ?,
             ?, ?, ?, ?, ?,
             ?, 0,
+            0,
             ?, ?,
             ?, 1, 0
         )
@@ -303,26 +321,26 @@ def open_trade(
         quantity_total, qty_leg1, qty_leg1,
         position_usdt, leverage,
         stop_loss, take_profit, sl_distance, atr, rrr,
-        stop_loss,  # Initial trailing SL = original SL
+        stop_loss,
         signal_score, confluence,
-        now, # leg2 is pending
+        now,
     ))
 
     trade_id = c.lastrowid
     conn.commit()
 
     logger.info(
-        f"Trade opened: {symbol.replace('/USDT:USDT','')} "
+        f"Trade opened: {symbol.replace('/USDT:USDT', '')} "
         f"{direction.upper()} | {tier} | {timeframe} | "
         f"Entry: {fill_price_leg1:.4f} | "
-        f"SL: {stop_loss:.4f} | TP: {take_profit:.4f} | "
-        f"Qty: {qty_leg1} (Leg 1 of 2) | "
-        f"ID: {trade_id}"
+        f"SL: {stop_loss:.4f} ({sl_distance / fill_price_leg1 * 100:.2f}%) | "
+        f"TP: {take_profit:.4f} | RRR: {rrr:.2f} | "
+        f"Qty: {qty_leg1} (Leg 1 of 2) | ID: {trade_id}"
     )
 
     try:
         from bot.config import apex_logger
-        _tid = f"{symbol.replace('/USDT:USDT','')}_{now[:10].replace('-','')}_{now[11:16].replace(':','')}"
+        _tid = f"{symbol.replace('/USDT:USDT', '')}_{now[:10].replace('-', '')}_{now[11:16].replace(':', '')}"
         apex_logger.trade_entry_leg(
             trade_id         = _tid,
             token            = symbol,
@@ -338,10 +356,10 @@ def open_trade(
             tier             = tier,
             timeframe        = timeframe,
             decision_context = {
-                "signal_score":  signal_score,
-                "confluence":    confluence,
-                "db_trade_id":   trade_id,
-                "leverage":      leverage,
+                "signal_score": signal_score,
+                "confluence":   confluence,
+                "db_trade_id":  trade_id,
+                "leverage":     leverage,
             },
         )
     except Exception:
@@ -359,9 +377,8 @@ def process_leg2(
     """
     Process Leg 2 entry for a pending two-leg trade.
 
-    Leg 2 triggers if:
-    - Price pulls back to EMA within 3 candles → enter at EMA price
-    - No pullback after 3 candles → enter at original entry price
+    Triggers if price pulls back to EMA within 3 candles,
+    or at original entry price after 3 candles without pullback.
 
     Returns True if Leg 2 was entered.
     """
@@ -379,7 +396,6 @@ def process_leg2(
     qty_leg2  = round(qty_total * ENTRY["leg2_pct"], 6)
     max_wait  = ENTRY["leg2_candle_window"]
 
-    # Check if pullback to EMA has occurred
     pullback_occurred = (
         (direction == "long"  and current_price <= ema_price) or
         (direction == "short" and current_price >= ema_price)
@@ -395,7 +411,6 @@ def process_leg2(
         logger.info(f"Leg 2 triggered by timeout: {symbol} at {leg2_price:.4f}")
 
     if leg2_price is None:
-        # Increment candle counter and wait
         conn.cursor().execute(
             "UPDATE trades SET leg2_candles_waited = ? WHERE id = ?",
             (candles_waited + 1, trade_id)
@@ -403,7 +418,6 @@ def process_leg2(
         conn.commit()
         return False
 
-    # Place Leg 2 order
     order2 = _place_order(symbol, direction, qty_leg2, "market", leg2_price)
     if not order2:
         logger.warning(f"Leg 2 order failed for {symbol} — trade continues with Leg 1 only")
@@ -416,7 +430,6 @@ def process_leg2(
 
     fill_price_leg2 = order2.get("price", leg2_price)
 
-    # Calculate new average entry price
     avg_entry = (
         (entry_price * qty_leg1) + (fill_price_leg2 * qty_leg2)
     ) / (qty_leg1 + qty_leg2)
@@ -435,7 +448,7 @@ def process_leg2(
     conn.commit()
 
     logger.info(
-        f"Leg 2 entered: {symbol.replace('/USDT:USDT','')} | "
+        f"Leg 2 entered: {symbol.replace('/USDT:USDT', '')} | "
         f"Leg 2 price: {fill_price_leg2:.4f} | "
         f"Avg entry: {avg_entry:.4f}"
     )
@@ -456,38 +469,35 @@ def update_trailing_sl(
     Update trailing stop loss based on current price.
 
     Rules:
-    - At 1x risk in profit → move SL to breakeven
-    - At 1.5x risk in profit → trail SL to lock 0.5x risk as profit
-    - After primary TP hit → trail with 1x ATR
+    - At 1× risk in profit → move SL to breakeven
+    - At 1.5× risk in profit → trail SL to lock 0.5× risk as profit
+    - After primary TP hit → trail with 1× ATR
 
     Returns updated trade dict.
     """
-    trade_id    = trade["id"]
-    direction   = trade["direction"]
-    avg_entry   = trade["avg_entry_price"]
-    sl_distance = trade["sl_distance"]
-    current_sl  = trade["trailing_sl"]
+    trade_id     = trade["id"]
+    direction    = trade["direction"]
+    avg_entry    = trade["avg_entry_price"]
+    sl_distance  = trade["sl_distance"]
+    current_sl   = trade["trailing_sl"]
     at_breakeven = bool(trade["at_breakeven"])
-    tp_hit      = bool(trade.get("tier2_tp_hit", 0))
+    tp_hit       = bool(trade.get("tier2_tp_hit", 0))
 
-    new_sl      = current_sl
-    at_be       = at_breakeven
+    new_sl = current_sl
+    at_be  = at_breakeven
 
     if direction == "long":
         profit_dist = current_price - avg_entry
 
-        # Move to breakeven at 1x risk
         if not at_breakeven and profit_dist >= sl_distance * TRAILING_SL["breakeven_at"]:
             new_sl = avg_entry
             at_be  = True
-            logger.info(f"SL moved to breakeven: {trade['symbol'].replace('/USDT:USDT','')}")
+            logger.info(f"SL moved to breakeven: {trade['symbol'].replace('/USDT:USDT', '')}")
 
-        # Trail to lock 0.5x risk at 1.5x risk in profit
         if profit_dist >= sl_distance * TRAILING_SL["trail_at"]:
             lock_sl = avg_entry + (sl_distance * TRAILING_SL["trail_lock"])
             new_sl  = max(new_sl, lock_sl)
 
-        # Trail with ATR after primary TP hit
         if tp_hit and current_atr > 0:
             atr_trail = current_price - (current_atr * TP["trail_atr_multiplier"])
             new_sl    = max(new_sl, atr_trail)
@@ -495,23 +505,19 @@ def update_trailing_sl(
     else:  # short
         profit_dist = avg_entry - current_price
 
-        # Move to breakeven
         if not at_breakeven and profit_dist >= sl_distance * TRAILING_SL["breakeven_at"]:
             new_sl = avg_entry
             at_be  = True
-            logger.info(f"SL moved to breakeven: {trade['symbol'].replace('/USDT:USDT','')}")
+            logger.info(f"SL moved to breakeven: {trade['symbol'].replace('/USDT:USDT', '')}")
 
-        # Trail to lock profit
         if profit_dist >= sl_distance * TRAILING_SL["trail_at"]:
             lock_sl = avg_entry - (sl_distance * TRAILING_SL["trail_lock"])
             new_sl  = min(new_sl, lock_sl)
 
-        # Trail with ATR after primary TP hit
         if tp_hit and current_atr > 0:
             atr_trail = current_price + (current_atr * TP["trail_atr_multiplier"])
             new_sl    = min(new_sl, atr_trail)
 
-    # Update DB if SL changed
     if new_sl != current_sl or at_be != at_breakeven:
         conn.cursor().execute("""
             UPDATE trades SET trailing_sl = ?, at_breakeven = ? WHERE id = ?
@@ -523,18 +529,23 @@ def update_trailing_sl(
     return trade
 
 
-
 def check_primary_tp(
-    conn,
+    conn: sqlite3.Connection,
     trade: dict,
     current_high: float,
     current_low: float,
 ) -> bool:
     """
     Tiered TP exit strategy:
-    - Tier 1: Close 40% at 1.5x RRR
-    - Tier 2: Close 30% at 2.0x RRR
-    - Remaining 30%: trail with 1.5x ATR
+    - Stage 1: Close 40% at 1.5× RRR
+    - Stage 2: Close 30% at 2.0× RRR
+    - Remaining 30%: trail with 1.5× ATR
+
+    FIX: After each partial close, PnL is now:
+    1. Accumulated to partial_pnl_usdt in the trades table.
+    2. Immediately reflected in capital via update_capital().
+    Previously, partial TP profits were never written to the database
+    or added to capital — capital was systematically understated.
     """
     trade_id      = trade["id"]
     direction     = trade["direction"]
@@ -562,7 +573,7 @@ def check_primary_tp(
     close_side = "sell" if direction == "long" else "buy"
     hit_any    = False
 
-    # Tier 1 — close 40% at 1.5x RRR
+    # Stage 1 — close 40% at 1.5× RRR
     if not tier1_hit:
         t1_hit = (
             (direction == "long"  and current_high >= tp1) or
@@ -572,41 +583,73 @@ def check_primary_tp(
             qty_close = round(qty_remaining * t1_pct, 6)
             order = _place_order(trade["symbol"], close_side, qty_close, "market", tp1)
             if order:
-                pnl = ((tp1 - avg_entry) if direction == "long" else (avg_entry - tp1)) * qty_close
+                pnl     = ((tp1 - avg_entry) if direction == "long" else (avg_entry - tp1)) * qty_close
                 new_qty = round(qty_remaining - qty_close, 6)
-                conn.cursor().execute(
-                    "UPDATE trades SET tier1_tp_hit=1, quantity_remaining=? WHERE id=?",
-                    (new_qty, trade_id)
-                )
-                conn.commit()
-                logger.info(f"Tier1 TP: {trade['symbol'].replace('/USDT:USDT','')} | 40% closed at {tp1:.4f} | PnL: {pnl:.2f} | 60% running...")
-                trade["tier1_tp_hit"] = 1
-                trade["quantity_remaining"] = new_qty
-                qty_remaining = new_qty
-                tier1_hit     = True
-                hit_any       = True
 
-    # Tier 2 — close 30% at 2x RRR
+                conn.cursor().execute("""
+                    UPDATE trades SET
+                        tier1_tp_hit     = 1,
+                        quantity_remaining = ?,
+                        partial_pnl_usdt = COALESCE(partial_pnl_usdt, 0) + ?
+                    WHERE id = ?
+                """, (new_qty, round(pnl, 4), trade_id))
+                conn.commit()
+
+                # FIX: Update capital immediately after partial close
+                capital = get_capital(conn)
+                update_capital(conn, capital + pnl)
+
+                logger.info(
+                    f"Stage1 TP: {trade['symbol'].replace('/USDT:USDT', '')} | "
+                    f"40% closed at {tp1:.4f} | "
+                    f"PnL: +{pnl:.2f} USDT | "
+                    f"Remaining: {new_qty:.6f} ({int((1 - t1_pct) * 100)}%)"
+                )
+
+                trade["tier1_tp_hit"]      = 1
+                trade["quantity_remaining"] = new_qty
+                trade["partial_pnl_usdt"]  = trade.get("partial_pnl_usdt", 0) + pnl
+                qty_remaining               = new_qty
+                tier1_hit                   = True
+                hit_any                     = True
+
+    # Stage 2 — close 30% at 2.0× RRR
     if tier1_hit and not tier2_hit:
         t2_hit = (
             (direction == "long"  and current_high >= tp2) or
             (direction == "short" and current_low  <= tp2)
         )
         if t2_hit:
+            # Proportion of current remaining qty to close (30% of original total)
             qty_close = round(qty_remaining * (t2_pct / (1 - t1_pct + 0.001)), 6)
             order = _place_order(trade["symbol"], close_side, qty_close, "market", tp2)
             if order:
-                pnl = ((tp2 - avg_entry) if direction == "long" else (avg_entry - tp2)) * qty_close
+                pnl     = ((tp2 - avg_entry) if direction == "long" else (avg_entry - tp2)) * qty_close
                 new_qty = round(qty_remaining - qty_close, 6)
-                conn.cursor().execute(
-                    "UPDATE trades SET tier2_tp_hit=1, quantity_remaining=? WHERE id=?",
-                    (new_qty, trade_id)
-                )
+
+                conn.cursor().execute("""
+                    UPDATE trades SET
+                        tier2_tp_hit     = 1,
+                        quantity_remaining = ?,
+                        partial_pnl_usdt = COALESCE(partial_pnl_usdt, 0) + ?
+                    WHERE id = ?
+                """, (new_qty, round(pnl, 4), trade_id))
                 conn.commit()
-                logger.info(f"Tier2 TP: {trade['symbol'].replace('/USDT:USDT','')} | 30% closed at {tp2:.4f} | PnL: {pnl:.2f} | 30% trailing...")
+
+                # FIX: Update capital immediately after partial close
+                capital = get_capital(conn)
+                update_capital(conn, capital + pnl)
+
+                logger.info(
+                    f"Stage2 TP: {trade['symbol'].replace('/USDT:USDT', '')} | "
+                    f"30% closed at {tp2:.4f} | "
+                    f"PnL: +{pnl:.2f} USDT | "
+                    f"Remaining: {new_qty:.6f} (30% trailing)"
+                )
                 hit_any = True
 
     return hit_any
+
 
 def close_trade(
     conn: sqlite3.Connection,
@@ -617,6 +660,13 @@ def close_trade(
 ) -> dict:
     """
     Close a trade and record final PnL.
+
+    FIX: total_pnl now correctly includes partial TP profits taken earlier.
+    Previously, close_trade() only calculated PnL on the remaining quantity,
+    ignoring profits already banked from stage1 and stage2 TP closes.
+
+    total_pnl = partial_pnl_usdt  (stage1 + stage2 TP profits)
+              + remaining_pnl     (final close at exit_price)
 
     Args:
         conn:             Database connection
@@ -632,9 +682,7 @@ def close_trade(
     symbol        = trade["symbol"]
     avg_entry     = trade["avg_entry_price"]
     qty_remaining = trade["quantity_remaining"]
-    leverage      = trade["leverage"]
     position_usdt = trade["position_size_usdt"]
-    tp_hit        = bool(trade["tier1_tp_hit"])
 
     # Place closing order
     close_side = "sell" if direction == "long" else "buy"
@@ -644,33 +692,37 @@ def close_trade(
         logger.error(f"Close order failed for {symbol} — retrying...")
         order = _place_order(symbol, close_side, qty_remaining, "market", exit_price)
 
-    # qty already includes leverage (pos_usdt * leverage / entry) — do NOT multiply again
+    # PnL on the remaining open quantity
     if direction == "long":
         remaining_pnl = (exit_price - avg_entry) * qty_remaining
     else:
         remaining_pnl = (avg_entry - exit_price) * qty_remaining
-    # Total PnL includes any partial TP already taken
-    # (partial TP PnL was recorded when tier1_tp_hit was set)
-    total_pnl     = remaining_pnl
-    pnl_pct       = (total_pnl / position_usdt) * 100
+
+    # FIX: Include PnL from partial TP closes (stage1 + stage2) in total.
+    # These profits were banked earlier and recorded to partial_pnl_usdt.
+    partial_pnl = trade.get("partial_pnl_usdt", 0) or 0
+    total_pnl   = remaining_pnl + partial_pnl
+    pnl_pct     = (total_pnl / position_usdt) * 100
 
     now = datetime.now(timezone.utc).isoformat()
 
     conn.cursor().execute("""
         UPDATE trades SET
-            status       = 'closed',
-            exit_price   = ?,
-            exit_reason  = ?,
-            pnl_usdt     = ?,
-            pnl_pct      = ?,
-            exit_time    = ?
+            status      = 'closed',
+            exit_price  = ?,
+            exit_reason = ?,
+            pnl_usdt    = ?,
+            pnl_pct     = ?,
+            exit_time   = ?
         WHERE id = ?
     """, (exit_price, reason, round(total_pnl, 4), round(pnl_pct, 4), now, trade_id))
     conn.commit()
 
-    # Update capital
-    capital = get_capital(conn)
-    new_capital = capital + total_pnl
+    # Update capital with the remaining quantity close PnL.
+    # Note: partial TP capital updates happened in check_primary_tp(),
+    # so we only add remaining_pnl here to avoid double-counting.
+    capital     = get_capital(conn)
+    new_capital = capital + remaining_pnl
     update_capital(conn, new_capital)
 
     # Set cooldown after SL hit
@@ -679,10 +731,12 @@ def close_trade(
         set_cooldown(cooldown_tracker, symbol, trade["timeframe"])
 
     logger.info(
-        f"Trade closed: {symbol.replace('/USDT:USDT','')} "
+        f"Trade closed: {symbol.replace('/USDT:USDT', '')} "
         f"{direction.upper()} | "
         f"Exit: {exit_price:.4f} | "
-        f"PnL: {total_pnl:+.2f} USDT ({pnl_pct:+.2f}%) | "
+        f"Partial TP PnL: {partial_pnl:+.2f} | "
+        f"Remaining PnL: {remaining_pnl:+.2f} | "
+        f"Total PnL: {total_pnl:+.2f} USDT ({pnl_pct:+.2f}%) | "
         f"Reason: {reason}"
     )
 
@@ -750,20 +804,19 @@ def monitor_open_trades(
         ema_price     = latest.get("ema_fast", current_price)
 
         direction   = trade["direction"]
-        trailing_sl = trade["trailing_sl"]
 
         try:
             # Process Leg 2 if pending
             if trade.get("leg2_pending"):
                 process_leg2(conn, trade, current_price, ema_price)
-                trade = get_trade(conn, trade["id"])  # Refresh
+                trade = get_trade(conn, trade["id"])
 
             # Update trailing SL
             trade = update_trailing_sl(conn, trade, current_price, current_atr)
 
-            # Check primary TP
+            # Check primary TP (partial closes handled inside)
             check_primary_tp(conn, trade, current_high, current_low)
-            trade = get_trade(conn, trade["id"])  # Refresh after TP check
+            trade = get_trade(conn, trade["id"])
 
             # Increment candle counter
             conn.cursor().execute(
@@ -788,8 +841,8 @@ def monitor_open_trades(
                 continue
 
             # Check time stop
-            time_stop = TIME_STOP_CANDLES.get(timeframe, 30)
-            if trade["candles_open"] >= time_stop:
+            time_limit = TIME_STOP_CANDLES.get(timeframe, 30)
+            if trade["candles_open"] >= time_limit:
                 closed = close_trade(
                     conn, trade, current_price,
                     "time_stop", cooldown_tracker
@@ -797,7 +850,7 @@ def monitor_open_trades(
                 closed_trades.append(closed)
                 continue
 
-            # Check if remaining 30% hit trailing SL after primary TP
+            # Check if trailing 30% hit trailing SL after stage2 TP
             if trade.get("tier2_tp_hit", 0):
                 trail_sl_hit = (
                     (direction == "long"  and current_low  <= trade["trailing_sl"]) or
@@ -824,27 +877,25 @@ def get_performance_stats(conn: sqlite3.Connection) -> dict:
     """Calculate performance statistics from closed trades."""
     c = conn.cursor()
 
-    c.execute("""
-        SELECT pnl_usdt, pnl_pct FROM trades WHERE status = 'closed'
-    """)
+    c.execute("SELECT pnl_usdt, pnl_pct FROM trades WHERE status = 'closed'")
     rows = c.fetchall()
 
     if not rows:
         capital = get_capital(conn)
         return {
-            "capital":     capital,
-            "total_pnl":   0,
+            "capital":      capital,
+            "total_pnl":    0,
             "total_trades": 0,
-            "win_rate":    0,
-            "expectancy":  0,
-            "avg_win":     0,
-            "avg_loss":    0,
-            "drawdown":    0,
+            "win_rate":     0,
+            "expectancy":   0,
+            "avg_win":      0,
+            "avg_loss":     0,
+            "drawdown":     0,
         }
 
-    pnls    = [r[0] for r in rows]
-    wins    = [p for p in pnls if p > 0]
-    losses  = [p for p in pnls if p <= 0]
+    pnls   = [r[0] for r in rows]
+    wins   = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
 
     capital    = get_capital(conn)
     total_pnl  = sum(pnls)
@@ -853,7 +904,6 @@ def get_performance_stats(conn: sqlite3.Connection) -> dict:
     avg_loss   = sum(losses) / len(losses) if losses else 0
     expectancy = (win_rate / 100 * avg_win) + ((1 - win_rate / 100) * avg_loss)
 
-    # Drawdown from peak
     import numpy as np
     cumulative = np.cumsum(pnls)
     peak       = np.maximum.accumulate(cumulative + INITIAL_CAPITAL)
