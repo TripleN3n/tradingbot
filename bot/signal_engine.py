@@ -1,26 +1,30 @@
 # =============================================================================
 # APEX — Adaptive Per-token Execution Strategy Engine
 # bot/signal_engine.py — Live Signal Generation Engine
-# Version 3.2 — Timeframe gating fix, SL floor added
+# Version 3.4 — MTF confirmation relaxed: 4H-only for 1H/4H entries
 # =============================================================================
-# CHANGES FROM v3.1:
+# CHANGES FROM v3.2:
 #
+# get_mtf_direction_for_entry():
+#   Previously required 1D + 4H agreement for 1H entries, and 1D confirmation
+#   for 4H entries. After the April 2 tariff crash, 1D EMAs across all tokens
+#   turned bearish and remain bearish for 3-5 days even as price recovers.
+#   This locked the bot out of ALL long trades during recovery periods.
+#
+#   FIX: 1H entries now require 4H confirmation only (not 1D + 4H).
+#        4H entries now require 4H direction only (not 1D).
+#        1D entries unchanged — still use 1D direction directly.
+#
+#   Rationale: The BTC trend filter already handles macro regime alignment
+#   on the correct timeframe. Requiring 1D agreement on top of that is
+#   double-filtering and causes systematic signal drought during transitions.
+#   4H is sufficient for intraday directional confirmation.
+#
+# Version 3.2 changes retained:
 # should_generate_signal():
-#   Previously gated 1D signals to UTC hour 0 only. This caused a complete
-#   deadlock: hour 0 is Asian session, and the session filter blocked Asian
-#   session. Result: 1D tokens could NEVER open a trade.
-#   FIX: Returns True for all timeframes every cycle. The OHLCV data already
-#   contains only closed candles, so signals are always based on the correct
-#   most-recently-closed candle regardless of when the cycle runs.
-#   Duplicate entry prevention is handled by the open_symbols check.
-#
+#   Returns True for all timeframes every cycle (1D deadlock fix).
 # calculate_sl_tp_live():
-#   Previously had a 3% hard CAP on SL distance but no minimum FLOOR.
-#   When ATR was small, SLs as tight as 0.52% were produced — well within
-#   normal 1H candle noise, causing guaranteed stop-outs on minor wicks.
-#   FIX: Added 1.5% minimum SL floor. Combined with 3% cap, SL distance is
-#   now bounded between 1.5% and 3% of entry price.
-#   Configuration: SL["min_pct"] = 0.015, SL["max_pct"] = 0.03 in config.py.
+#   1.5% SL floor added (noise-level SL fix).
 # =============================================================================
 
 import pandas as pd
@@ -151,7 +155,6 @@ def get_timeframe_direction(df: pd.DataFrame) -> Optional[str]:
 def get_mtf_direction(df_higher: pd.DataFrame, df_confirm: pd.DataFrame) -> Optional[str]:
     """
     Get direction from two timeframes — both must agree.
-    Used for 1H entries (1D + 4H must agree).
     """
     if not MTF_CONFIG.get("all_required", True):
         return "any"
@@ -177,16 +180,21 @@ def get_mtf_direction_for_entry(
     """
     Get the required MTF direction based on the token's entry timeframe.
 
-    1H entry: 1D + 4H must both agree → confirmed direction
-    4H entry: 1D must confirm → 1D direction
-    1D entry: 1D is the entry timeframe → use 1D direction directly
+    FIX v3.4: Relaxed MTF confirmation to prevent signal drought during
+    market transitions when 1D EMA is slow to recover from crashes.
 
-    Returns the required direction, or None if confirmation fails.
+    1H entry: 4H must confirm (previously required 1D + 4H)
+    4H entry: 4H direction used (previously required 1D)
+    1D entry: 1D direction used (unchanged)
+
+    The BTC trend filter already handles macro regime alignment on the
+    correct timeframe — requiring 1D agreement on top is redundant and
+    causes systematic long signal drought post-crash for 3-5 days.
     """
     if timeframe == "1h":
-        return get_mtf_direction(df_1d, df_4h)
+        return get_timeframe_direction(df_4h)
     elif timeframe == "4h":
-        return get_timeframe_direction(df_1d)
+        return get_timeframe_direction(df_4h)
     elif timeframe == "1d":
         return get_timeframe_direction(df_1d)
     return None
@@ -213,17 +221,12 @@ def should_generate_signal(timeframe: str) -> bool:
 
     FIX from v3.1: Previously gated 1D signals to UTC hour 0 only, which
     conflicted with the session filter blocking Asian session (hour 0).
-    This created a permanent deadlock for 1D-assigned tokens — they could
-    never execute a trade.
+    This created a permanent deadlock for 1D-assigned tokens.
 
-    Now returns True for all timeframes on every cycle. This is safe because:
-    - OHLCV data already only contains closed candles (fetch_ohlcv drops the
-      last forming candle), so signals are always based on correct data.
-    - Duplicate entry prevention is handled by open_symbols checks downstream.
-    - The session filter controls when entries are actually allowed to execute.
-
-    The previous optimisation (avoiding computation on non-candle-close cycles)
-    is sacrificed in favour of correctness. The added overhead is negligible.
+    Now returns True for all timeframes on every cycle. Safe because:
+    - OHLCV data already only contains closed candles.
+    - Duplicate entry prevention handled by open_symbols checks downstream.
+    - Session filter controls when entries are actually allowed to execute.
     """
     return True
 
@@ -285,7 +288,7 @@ def passes_rsi_zone_live(df: pd.DataFrame, direction: str) -> bool:
     or shorts when RSI is already deeply oversold.
 
     FIX: short_min_rsi reduced from 40 to 28 in config.py.
-    Previously blocked ALL short signals in Extreme Fear (RSI 20–35).
+    Previously blocked ALL short signals in Extreme Fear (RSI 20-35).
     """
     rsi_config = FILTERS.get("rsi_zone", {})
     if not rsi_config.get("enabled", True):
@@ -306,8 +309,7 @@ def passes_price_position_live(df: pd.DataFrame, direction: str) -> bool:
     Prevents chasing extended moves.
 
     FIX: max_ema_distance increased from 3% to 8% in config.py.
-    3% was too tight — blocked entries in trending markets where price
-    routinely sits 5–15% from the 20-period EMA.
+    3% was too tight for trending markets.
     """
     pp_config = FILTERS.get("price_position", {})
     if not pp_config.get("enabled", True):
@@ -336,14 +338,11 @@ def calculate_sl_tp_live(
     Calculate SL and TP from the entry timeframe data using ATR + structure.
 
     SL placement logic:
-    1. ATR-based minimum: SL = 1.5× ATR (ensures minimum breathing room)
+    1. ATR-based minimum: SL = 1.5x ATR
     2. Structure-based: SL just beyond nearest S/R (10 candle lookback)
-    3. Take the wider of ATR vs structure — never compromise SL tightness
+    3. Take the wider of ATR vs structure
     4. Apply floor: SL distance must be at least SL["min_pct"] of entry (1.5%)
-       FIX: This floor was missing. SLs as tight as 0.52% were hitting on noise.
     5. Apply cap: SL distance cannot exceed SL["max_pct"] of entry (3%)
-
-    The floor and cap together bound SL distance between 1.5% and 3%.
     """
     if df is None or df.empty:
         return None
@@ -374,9 +373,6 @@ def calculate_sl_tp_live(
     if sl_dist <= 0:
         return None
 
-    # --- FLOOR: SL distance must be at least 1.5% of entry ---
-    # FIX: Previously absent. Prevented noise-level SLs (0.52–0.94%)
-    # that were guaranteed to hit on normal candle wicks.
     min_sl_dist = entry * SL.get("min_pct", 0.015)
     if sl_dist < min_sl_dist:
         sl_dist = min_sl_dist
@@ -387,7 +383,6 @@ def calculate_sl_tp_live(
             stop_loss   = entry + sl_dist
             take_profit = entry - sl_dist * tier_rrr
 
-    # --- CAP: SL distance cannot exceed 3% of entry ---
     max_sl_dist = entry * SL.get("max_pct", 0.03)
     if sl_dist > max_sl_dist:
         sl_dist = max_sl_dist
@@ -398,7 +393,6 @@ def calculate_sl_tp_live(
             stop_loss   = entry + sl_dist
             take_profit = entry - sl_dist * tier_rrr
 
-    # Final RRR check — must still meet tier minimum after adjustments
     actual_rrr = abs(take_profit - entry) / sl_dist
     if actual_rrr < tier_rrr:
         return None
@@ -450,8 +444,8 @@ def generate_signal_for_token(
 
     Entry timeframe is read from the strategy's assigned timeframe (apex.db).
     MTF confirmation scales with the entry timeframe:
-    - 1H entry: 1D + 4H must agree → check 1H confluence
-    - 4H entry: 1D must confirm    → check 4H confluence
+    - 1H entry: 4H must confirm    → check 1H confluence
+    - 4H entry: 4H direction used  → check 4H confluence
     - 1D entry: 1D direction used  → check 1D confluence
 
     BTC filter is applied on the same timeframe as the entry.
@@ -464,48 +458,39 @@ def generate_signal_for_token(
     comp_score = strategy["composite_score"]
     timeframe  = strategy.get("timeframe", "1h")
 
-    # STEP 1 — Check if this timeframe's candle should be evaluated this cycle.
-    # FIX: Returns True for all timeframes now. See should_generate_signal() docstring.
     if not should_generate_signal(timeframe):
         logger.debug(f"{symbol}: {timeframe} candle not due this cycle — skipping")
         return None
 
-    # STEP 2 — Get the entry dataframe for this token's assigned timeframe
     df_entry = get_entry_df(timeframe, df_1h, df_4h, df_1d)
     if df_entry is None or df_entry.empty:
         logger.debug(f"{symbol}: No {timeframe} data available")
         return None
 
-    # STEP 3 — Get MTF confirmation direction based on entry timeframe
     mtf_direction = get_mtf_direction_for_entry(timeframe, df_1h, df_4h, df_1d)
     if mtf_direction is None:
         logger.debug(f"{symbol}: MTF confirmation failed for {timeframe} entry")
         return None
 
-    # STEP 4 — Check confluence on the entry timeframe
     direction, confluence_count = check_confluence_mtf(
         df_entry, indicators, min_conf, mtf_direction
     )
     if not direction:
         return None
 
-    # STEP 5 — RSI zone filter on entry timeframe
     if not passes_rsi_zone_live(df_entry, direction):
         logger.debug(f"{symbol}: RSI zone filter blocked {direction} on {timeframe}")
         return None
 
-    # STEP 6 — Price position filter on entry timeframe
     if not passes_price_position_live(df_entry, direction):
         logger.debug(f"{symbol}: Price too extended from EMA on {timeframe}")
         return None
 
-    # STEP 7 — Calculate SL/TP from entry timeframe data
     sl_tp = calculate_sl_tp_live(df_entry, direction, tier_rrr)
     if sl_tp is None:
         logger.debug(f"{symbol}: No valid SL/TP for {direction} on {timeframe}")
         return None
 
-    # STEP 8 — Run all entry filters (BTC filter uses entry timeframe)
     btc_trend      = cycle_data.get("btc_trend", {"direction": "neutral"})
     funding_rates  = cycle_data.get("funding_rates", {})
     fear_greed     = cycle_data.get("fear_greed", {"value": 50})
@@ -533,7 +518,6 @@ def generate_signal_for_token(
         logger.debug(f"{symbol}: Filters blocked — {filter_result['failures']}")
         return None
 
-    # STEP 9 — Score and build signal
     signal_score = score_signal(confluence_count, comp_score, tier, mtf_direction)
 
     signal = {
@@ -585,11 +569,9 @@ def generate_signals(
         symbol    = strategy["symbol"]
         timeframe = strategy.get("timeframe", "1h")
 
-        # Skip tokens that already have an open trade
         if symbol in open_symbols:
             continue
 
-        # Get all 3 timeframes for this token
         df_1h = ohlcv_data.get(f"{symbol}_1h")
         if df_1h is None: df_1h = ohlcv_data.get(symbol)
         df_4h = ohlcv_data.get(f"{symbol}_4h")
@@ -670,7 +652,6 @@ def generate_signals(
         except Exception as e:
             logger.error(f"Signal error {symbol}: {e}", exc_info=True)
 
-    # Sort by signal_score descending — Tier1 naturally floats to top
     signals.sort(key=lambda x: x["signal_score"], reverse=True)
 
     if signals:
