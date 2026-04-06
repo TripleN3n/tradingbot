@@ -1,7 +1,13 @@
 # =============================================================================
 # APEX — Adaptive Per-token Execution Strategy Engine
 # bot/filters.py — Entry Filters
-# Version 3.2 — Tier-aware session filter, timeframe parameter added
+# Version 3.3 — F&G hard block removed (lagging indicator, redundant with confluence)
+# =============================================================================
+# CHANGES FROM v3.2:
+# - filter_fear_greed(): Function retained but removed from run_all_filters().
+#   F&G is a lagging indicator — redundant with real-time technical confluence.
+#   RSI, EMA, Volume already capture sentiment in real time.
+#   Hard blocking longs during Extreme Fear caused missed recoveries.
 # =============================================================================
 # CHANGES FROM v3.1:
 # - filter_session(): Now tier-aware per strategy spec.
@@ -19,7 +25,7 @@
 # 2. Volume filter
 # 3. Liquidity filter
 # 4. Funding rate filter
-# 5. Fear & Greed filter
+# 5. Fear & Greed filter — RETAINED but NOT ACTIVE (removed from run_all_filters)
 # 6. BTC trend filter — matches token's entry timeframe exactly
 # 7. Correlation filter
 # 8. Session filter — tier-aware Asian session handling
@@ -117,6 +123,10 @@ def filter_funding_rate(funding_rate: float, direction: str) -> FilterResult:
 
 # =============================================================================
 # FILTER 5 — FEAR & GREED FILTER
+# RETAINED but NOT ACTIVE — removed from run_all_filters()
+# Reason: F&G is lagging — price recovers before F&G reflects it.
+# Real-time confluence (RSI, EMA, Volume) already captures sentiment.
+# Re-enable by adding back to filter_checks in run_all_filters() if needed.
 # =============================================================================
 
 def filter_fear_greed(fear_greed_value: int, direction: str) -> FilterResult:
@@ -296,11 +306,12 @@ def run_all_filters(
     timeframe: str,
 ) -> dict:
     """
-    Run all 9 entry filters in sequence.
+    Run all active entry filters in sequence.
     Returns dict with passed, size_multiplier, failures, details.
 
     BTC filter uses the token's entry timeframe to check the matching BTC direction.
     Session filter is now tier-aware — Asian session allowed for tier1/2 at 50% size.
+    F&G filter removed from active checks (v3.3) — lagging, redundant with confluence.
 
     To add a new filter:
     1. Create a filter function above
@@ -311,13 +322,11 @@ def run_all_filters(
     size_multiplier = 1.0
     failures        = []
 
-    # FIX: filter_session now receives timeframe for logging clarity
     filter_checks = [
         ("candle_close",  lambda: filter_candle_close(df)),
         ("volume",        lambda: filter_volume(df)),
         ("liquidity",     lambda: filter_liquidity(daily_volume_usd)),
         ("funding_rate",  lambda: filter_funding_rate(funding_rate, direction)),
-        ("fear_greed",    lambda: filter_fear_greed(fear_greed_value, direction)),
         ("btc_trend",     lambda: filter_btc_trend(btc_trend, direction, timeframe)),
         ("correlation",   lambda: filter_correlation(symbol, open_trades, price_history)),
         ("session",       lambda: filter_session(tier, timeframe)),
