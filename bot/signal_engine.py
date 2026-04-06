@@ -1,30 +1,29 @@
 # =============================================================================
 # APEX — Adaptive Per-token Execution Strategy Engine
 # bot/signal_engine.py — Live Signal Generation Engine
-# Version 3.4 — MTF confirmation relaxed: 4H-only for 1H/4H entries
+# Version 3.5 — EMA-only prerequisite in confluence check
 # =============================================================================
-# CHANGES FROM v3.2:
+# CHANGES FROM v3.4:
 #
+# check_confluence_mtf():
+#   Previously required BOTH EMA and macro_ref (VWAP/200EMA) to agree as a
+#   hard prerequisite before any other indicators were evaluated. After the
+#   April 2 crash, VWAP on 1H sits above price for hours during recovery —
+#   even when EMA has already crossed bullish. This caused all 1H long signals
+#   to fail silently with no debug output.
+#
+#   FIX: EMA is now the only hard prerequisite. macro_ref (VWAP/200EMA) is
+#   demoted to a regular confluence indicator — it still counts toward the
+#   confluence total but no longer hard-blocks signal generation on its own.
+#
+#   Rationale: EMA crossover is the primary trend signal. VWAP/200EMA is a
+#   confirmation tool. During recovery, VWAP lags price by hours — using it
+#   as a hard gate systematically blocks early trend entries.
+#
+# Version 3.4 changes retained:
 # get_mtf_direction_for_entry():
-#   Previously required 1D + 4H agreement for 1H entries, and 1D confirmation
-#   for 4H entries. After the April 2 tariff crash, 1D EMAs across all tokens
-#   turned bearish and remain bearish for 3-5 days even as price recovers.
-#   This locked the bot out of ALL long trades during recovery periods.
-#
-#   FIX: 1H entries now require 4H confirmation only (not 1D + 4H).
-#        4H entries now require 4H direction only (not 1D).
-#        1D entries unchanged — still use 1D direction directly.
-#
-#   Rationale: The BTC trend filter already handles macro regime alignment
-#   on the correct timeframe. Requiring 1D agreement on top of that is
-#   double-filtering and causes systematic signal drought during transitions.
-#   4H is sufficient for intraday directional confirmation.
-#
-# Version 3.2 changes retained:
-# should_generate_signal():
-#   Returns True for all timeframes every cycle (1D deadlock fix).
-# calculate_sl_tp_live():
-#   1.5% SL floor added (noise-level SL fix).
+#   1H entries: 4H confirmation only (not 1D+4H).
+#   4H entries: 4H direction only (not 1D).
 # =============================================================================
 
 import pandas as pd
@@ -168,7 +167,7 @@ def get_mtf_direction(df_higher: pd.DataFrame, df_confirm: pd.DataFrame) -> Opti
     if dir_higher == dir_confirm:
         return dir_higher
 
-    return None  # Disagree — market transitioning
+    return None
 
 
 def get_mtf_direction_for_entry(
@@ -186,10 +185,6 @@ def get_mtf_direction_for_entry(
     1H entry: 4H must confirm (previously required 1D + 4H)
     4H entry: 4H direction used (previously required 1D)
     1D entry: 1D direction used (unchanged)
-
-    The BTC trend filter already handles macro regime alignment on the
-    correct timeframe — requiring 1D agreement on top is redundant and
-    causes systematic long signal drought post-crash for 3-5 days.
     """
     if timeframe == "1h":
         return get_timeframe_direction(df_4h)
@@ -217,16 +212,8 @@ def get_entry_df(
 
 def should_generate_signal(timeframe: str) -> bool:
     """
-    Determine whether signal generation should run for this timeframe this cycle.
-
-    FIX from v3.1: Previously gated 1D signals to UTC hour 0 only, which
-    conflicted with the session filter blocking Asian session (hour 0).
-    This created a permanent deadlock for 1D-assigned tokens.
-
-    Now returns True for all timeframes on every cycle. Safe because:
-    - OHLCV data already only contains closed candles.
-    - Duplicate entry prevention handled by open_symbols checks downstream.
-    - Session filter controls when entries are actually allowed to execute.
+    Returns True for all timeframes every cycle.
+    FIX from v3.1: Removed UTC hour 0 gate that deadlocked 1D tokens.
     """
     return True
 
@@ -245,6 +232,12 @@ def check_confluence_mtf(
     Check confluence on the entry timeframe dataframe.
     Signal must match required_direction from MTF confirmation.
 
+    FIX v3.5: EMA is now the only hard prerequisite.
+    macro_ref (VWAP/200EMA) is demoted to a regular confluence indicator.
+    Previously, requiring BOTH ema AND macro_ref to agree caused all 1H long
+    signals to fail silently during recovery — VWAP lags price by hours after
+    a crash dump, blocking entries even when EMA has already crossed bullish.
+
     Returns (direction, confluence_count) or (None, 0).
     """
     if df is None or df.empty:
@@ -258,22 +251,24 @@ def check_confluence_mtf(
             if sig:
                 signals[ind] = sig
 
-    ema_sig   = signals.get("ema")
-    macro_sig = signals.get("macro_ref")
-
-    if not ema_sig or not macro_sig or ema_sig != macro_sig:
+    # EMA is the only hard prerequisite — direction is determined by EMA crossover
+    ema_sig = signals.get("ema")
+    if not ema_sig:
         return None, 0
 
     direction = ema_sig
 
+    # Must match MTF confirmed direction
     if required_direction != "any" and direction != required_direction:
         return None, 0
 
+    # Count all agreeing indicators including macro_ref
     agreeing = sum(1 for s in signals.values() if s == direction)
 
     if agreeing >= min_confluence:
         return direction, agreeing
 
+    logger.debug(f"Confluence insufficient: {agreeing}/{min_confluence} agreeing — signals: {signals}")
     return None, 0
 
 
@@ -284,11 +279,8 @@ def check_confluence_mtf(
 def passes_rsi_zone_live(df: pd.DataFrame, direction: str) -> bool:
     """
     Gate entries based on RSI zone.
-    Prevents entering longs when RSI is already overbought,
-    or shorts when RSI is already deeply oversold.
-
-    FIX: short_min_rsi reduced from 40 to 28 in config.py.
-    Previously blocked ALL short signals in Extreme Fear (RSI 20-35).
+    Prevents entering longs when RSI is overbought,
+    or shorts when RSI is deeply oversold.
     """
     rsi_config = FILTERS.get("rsi_zone", {})
     if not rsi_config.get("enabled", True):
@@ -307,9 +299,6 @@ def passes_price_position_live(df: pd.DataFrame, direction: str) -> bool:
     """
     Gate entries based on price distance from fast EMA.
     Prevents chasing extended moves.
-
-    FIX: max_ema_distance increased from 3% to 8% in config.py.
-    3% was too tight for trending markets.
     """
     pp_config = FILTERS.get("price_position", {})
     if not pp_config.get("enabled", True):
@@ -336,13 +325,7 @@ def calculate_sl_tp_live(
 ) -> Optional[dict]:
     """
     Calculate SL and TP from the entry timeframe data using ATR + structure.
-
-    SL placement logic:
-    1. ATR-based minimum: SL = 1.5x ATR
-    2. Structure-based: SL just beyond nearest S/R (10 candle lookback)
-    3. Take the wider of ATR vs structure
-    4. Apply floor: SL distance must be at least SL["min_pct"] of entry (1.5%)
-    5. Apply cap: SL distance cannot exceed SL["max_pct"] of entry (3%)
+    SL bounded between 1.5% (floor) and 3% (cap) of entry price.
     """
     if df is None or df.empty:
         return None
@@ -441,14 +424,8 @@ def generate_signal_for_token(
 ) -> Optional[dict]:
     """
     Generate a trading signal for a single token.
-
-    Entry timeframe is read from the strategy's assigned timeframe (apex.db).
-    MTF confirmation scales with the entry timeframe:
-    - 1H entry: 4H must confirm    → check 1H confluence
-    - 4H entry: 4H direction used  → check 4H confluence
-    - 1D entry: 1D direction used  → check 1D confluence
-
-    BTC filter is applied on the same timeframe as the entry.
+    Entry timeframe read from strategy's assigned timeframe (apex.db).
+    MTF confirmation: 1H→4H, 4H→4H, 1D→1D.
     """
     symbol     = strategy["symbol"]
     tier       = strategy["tier"]
@@ -558,7 +535,6 @@ def generate_signals(
 ) -> list:
     """
     Generate signals for all active tokens.
-    Each token uses its assigned timeframe from apex.db.
     Returns list sorted by signal_score descending (Tier1 first).
     """
     ohlcv_data   = cycle_data.get("ohlcv", {})
