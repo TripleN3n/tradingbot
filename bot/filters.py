@@ -149,6 +149,8 @@ def filter_btc_trend(
     btc_trend: dict,
     direction: str,
     timeframe: str,
+    tier: str = "tier3",
+    confluence_count: int = 0,
 ) -> FilterResult:
     """
     BTC trend filter — checks BTC direction on the SAME timeframe as token entry.
@@ -160,7 +162,9 @@ def filter_btc_trend(
     Rules:
     - BTC neutral on that timeframe → trade allowed
     - BTC aligned with trade direction → trade allowed
-    - BTC opposed to trade direction → trade blocked
+    - BTC opposed to trade direction:
+        Tier1 / Tier2 → soft override: allowed if confluence_count >= 4
+        Tier3         → soft override: allowed if confluence_count >= 5
     """
     if not BTC_FILTER.get("enabled", True):
         return FilterResult(True, "BTC filter disabled")
@@ -178,9 +182,22 @@ def filter_btc_trend(
     if aligned:
         return FilterResult(True, f"BTC {timeframe} aligned: {btc_direction}")
 
+    # BTC conflict — check soft override by tier
+    if tier in ("tier1", "tier2") and confluence_count >= 4:
+        return FilterResult(
+            True,
+            f"BTC {timeframe} conflict overridden: {tier} with {confluence_count}/5 confluence"
+        )
+
+    if tier == "tier3" and confluence_count >= 5:
+        return FilterResult(
+            True,
+            f"BTC {timeframe} conflict overridden: tier3 with {confluence_count}/5 confluence"
+        )
+
     return FilterResult(
         False,
-        f"BTC {timeframe} conflict: BTC={btc_direction}, signal={direction}"
+        f"BTC {timeframe} conflict: BTC={btc_direction}, signal={direction} (confluence {confluence_count} insufficient for override)"
     )
 
 
@@ -327,7 +344,7 @@ def run_all_filters(
         ("volume",        lambda: filter_volume(df)),
         ("liquidity",     lambda: filter_liquidity(daily_volume_usd)),
         ("funding_rate",  lambda: filter_funding_rate(funding_rate, direction)),
-        ("btc_trend",     lambda: filter_btc_trend(btc_trend, direction, timeframe)),
+        ("btc_trend",     lambda: filter_btc_trend(btc_trend, direction, timeframe, tier, confluence_count)),
         ("correlation",   lambda: filter_correlation(symbol, open_trades, price_history)),
         ("session",       lambda: filter_session(tier, timeframe)),
         ("cooldown",      lambda: filter_cooldown(symbol, cooldown_tracker)),
