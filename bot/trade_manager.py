@@ -1,27 +1,33 @@
 # =============================================================================
 # APEX — Adaptive Per-token Execution Strategy Engine
 # bot/trade_manager.py — Trade Execution & Management
-# Version 3.2 — Partial TP PnL accounting fixed
+# Version 3.6 — Time-based time stop + cooldown after time_stop
 # =============================================================================
-# CHANGES FROM v3.1:
+# CHANGES FROM v3.2:
 #
-# init_trades_db():
-#   Added partial_pnl_usdt column (REAL DEFAULT 0) via safe ALTER TABLE.
-#   Stores accumulated PnL from partial TP closes (tier1 + tier2 exits).
+# monitor_open_trades():
+#   FIXED: Time stop was counting 1H bot cycles regardless of the token's
+#   assigned timeframe. A 1D token with TIME_STOP_CANDLES["1d"]=10 would
+#   exit after 10 *hours* (10 bot cycles), not 10 days. This caused CFX
+#   (1D token) to time-stop after 4 hours and immediately re-enter the
+#   same stale signal, bleeding capital in a loop (4 consecutive losses
+#   on Apr 8, ~$135 total).
 #
-# check_primary_tp():
-#   After each partial TP close, now:
-#   1. Accumulates PnL to partial_pnl_usdt column in trades table.
-#   2. Immediately updates capital via update_capital().
-#   Previously, partial TP profits were calculated but never recorded
-#   to the database or reflected in capital. Capital was understated
-#   by the full amount of every partial TP profit taken.
+#   FIX: Replaced candle counter check with time-elapsed check.
+#   TIME_STOP_HOURS maps each timeframe to the correct real-world duration:
+#     1H  → 30 hours  (30 × 1H candles)
+#     4H  → 120 hours (30 × 4H candles = 5 days)
+#     1D  → 240 hours (10 × 1D candles = 10 days)
+#   candles_open counter is retained for dashboard display only.
 #
 # close_trade():
-#   Total PnL now = partial_pnl_usdt (from all prior partial TPs)
-#                 + remaining_pnl (from the final close quantity).
-#   pnl_pct reflects the true total return on position_size_usdt.
-#   Previously only the remaining quantity PnL was recorded.
+#   FIXED: Cooldown was only set after stop_loss exits. After a time_stop,
+#   no cooldown was applied — the slot released and the same stale candle
+#   signal immediately re-fired. Cooldown now triggers on both stop_loss
+#   and time_stop exits.
+#
+# Version 3.2 changes retained:
+#   partial_pnl_usdt column and TP accounting fixes.
 # =============================================================================
 # RESPONSIBILITY:
 # Handles all trade lifecycle operations:
@@ -47,6 +53,24 @@ from bot.data_feed import get_exchange
 # =============================================================================
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# TIME STOP DURATION MAP
+# FIX v3.6: Time stop is now time-elapsed based, not candle-count based.
+# candles_open increments every 1H bot cycle regardless of token timeframe,
+# so using it as a time stop gate was incorrect for 4H and 1D tokens.
+#
+# Mapping: timeframe → total hours before time stop triggers
+#   1H:  30 candles × 1H  = 30 hours
+#   4H:  30 candles × 4H  = 120 hours (5 days)
+#   1D:  10 candles × 24H = 240 hours (10 days)
+# =============================================================================
+
+TIME_STOP_HOURS = {
+    "1h":  30,
+    "4h":  120,
+    "1d":  240,
+}
 
 
 # =============================================================================
@@ -96,8 +120,7 @@ def init_trades_db(conn: sqlite3.Connection):
             pnl_usdt            REAL,
             pnl_pct             REAL,
 
-            -- Partial TP accumulator (FIX: new column)
-            -- Stores sum of PnL from all partial TP exits before final close.
+            -- Partial TP accumulator
             partial_pnl_usdt    REAL DEFAULT 0,
 
             -- Metadata
@@ -127,7 +150,6 @@ def init_trades_db(conn: sqlite3.Connection):
     conn.commit()
 
     # Safe migration: add partial_pnl_usdt to existing tables that predate this column.
-    # ALTER TABLE ADD COLUMN is idempotent-safe via try/except — fails silently if exists.
     try:
         c.execute("ALTER TABLE trades ADD COLUMN partial_pnl_usdt REAL DEFAULT 0")
         conn.commit()
@@ -541,11 +563,9 @@ def check_primary_tp(
     - Stage 2: Close 30% at 2.0× RRR
     - Remaining 30%: trail with 1.5× ATR
 
-    FIX: After each partial close, PnL is now:
+    After each partial close, PnL is:
     1. Accumulated to partial_pnl_usdt in the trades table.
     2. Immediately reflected in capital via update_capital().
-    Previously, partial TP profits were never written to the database
-    or added to capital — capital was systematically understated.
     """
     trade_id      = trade["id"]
     direction     = trade["direction"]
@@ -588,14 +608,13 @@ def check_primary_tp(
 
                 conn.cursor().execute("""
                     UPDATE trades SET
-                        tier1_tp_hit     = 1,
+                        tier1_tp_hit       = 1,
                         quantity_remaining = ?,
-                        partial_pnl_usdt = COALESCE(partial_pnl_usdt, 0) + ?
+                        partial_pnl_usdt   = COALESCE(partial_pnl_usdt, 0) + ?
                     WHERE id = ?
                 """, (new_qty, round(pnl, 4), trade_id))
                 conn.commit()
 
-                # FIX: Update capital immediately after partial close
                 capital = get_capital(conn)
                 update_capital(conn, capital + pnl)
 
@@ -620,7 +639,6 @@ def check_primary_tp(
             (direction == "short" and current_low  <= tp2)
         )
         if t2_hit:
-            # Proportion of current remaining qty to close (30% of original total)
             qty_close = round(qty_remaining * (t2_pct / (1 - t1_pct + 0.001)), 6)
             order = _place_order(trade["symbol"], close_side, qty_close, "market", tp2)
             if order:
@@ -629,14 +647,13 @@ def check_primary_tp(
 
                 conn.cursor().execute("""
                     UPDATE trades SET
-                        tier2_tp_hit     = 1,
+                        tier2_tp_hit       = 1,
                         quantity_remaining = ?,
-                        partial_pnl_usdt = COALESCE(partial_pnl_usdt, 0) + ?
+                        partial_pnl_usdt   = COALESCE(partial_pnl_usdt, 0) + ?
                     WHERE id = ?
                 """, (new_qty, round(pnl, 4), trade_id))
                 conn.commit()
 
-                # FIX: Update capital immediately after partial close
                 capital = get_capital(conn)
                 update_capital(conn, capital + pnl)
 
@@ -661,19 +678,20 @@ def close_trade(
     """
     Close a trade and record final PnL.
 
-    FIX: total_pnl now correctly includes partial TP profits taken earlier.
-    Previously, close_trade() only calculated PnL on the remaining quantity,
-    ignoring profits already banked from stage1 and stage2 TP closes.
-
     total_pnl = partial_pnl_usdt  (stage1 + stage2 TP profits)
               + remaining_pnl     (final close at exit_price)
+
+    FIX v3.6: Cooldown now applied after both stop_loss AND time_stop exits.
+    Previously only stop_loss triggered cooldown — after a time_stop the slot
+    released immediately and the same stale candle signal re-fired on the
+    next bot cycle, causing repeated entries into losing conditions.
 
     Args:
         conn:             Database connection
         trade:            Trade dict from get_open_trades()
         exit_price:       Price at which trade exits
         reason:           'stop_loss', 'take_profit', 'time_stop', 'manual'
-        cooldown_tracker: Optional dict to update cooldown after SL hit
+        cooldown_tracker: Optional dict to update cooldown after SL/time_stop
 
     Returns updated trade dict with PnL.
     """
@@ -698,8 +716,7 @@ def close_trade(
     else:
         remaining_pnl = (avg_entry - exit_price) * qty_remaining
 
-    # FIX: Include PnL from partial TP closes (stage1 + stage2) in total.
-    # These profits were banked earlier and recorded to partial_pnl_usdt.
+    # Include PnL from partial TP closes in total
     partial_pnl = trade.get("partial_pnl_usdt", 0) or 0
     total_pnl   = remaining_pnl + partial_pnl
     pnl_pct     = (total_pnl / position_usdt) * 100
@@ -718,15 +735,16 @@ def close_trade(
     """, (exit_price, reason, round(total_pnl, 4), round(pnl_pct, 4), now, trade_id))
     conn.commit()
 
-    # Update capital with the remaining quantity close PnL.
-    # Note: partial TP capital updates happened in check_primary_tp(),
-    # so we only add remaining_pnl here to avoid double-counting.
+    # Update capital with remaining quantity close PnL only.
+    # Partial TP capital updates happened in check_primary_tp() already.
     capital     = get_capital(conn)
     new_capital = capital + remaining_pnl
     update_capital(conn, new_capital)
 
-    # Set cooldown after SL hit
-    if reason == "stop_loss" and cooldown_tracker is not None:
+    # FIX v3.6: Apply cooldown after stop_loss OR time_stop.
+    # time_stop means the setup failed to move — same stale signal should
+    # not re-fire immediately on the next bot cycle.
+    if reason in ("stop_loss", "time_stop") and cooldown_tracker is not None:
         from bot.filters import set_cooldown
         set_cooldown(cooldown_tracker, symbol, trade["timeframe"])
 
@@ -783,6 +801,11 @@ def monitor_open_trades(
     Monitor all open trades for SL hits, TP hits, and time stops.
     Called every bot cycle.
 
+    FIX v3.6: Time stop now uses time-elapsed (hours) rather than
+    candles_open counter. candles_open increments every 1H bot cycle
+    regardless of the token's assigned timeframe, so a 1D token would
+    incorrectly time-stop after 10 *hours* instead of 10 *days*.
+
     Returns (closed_trades, updated_cooldown_tracker)
     """
     closed_trades = []
@@ -818,7 +841,7 @@ def monitor_open_trades(
             check_primary_tp(conn, trade, current_high, current_low)
             trade = get_trade(conn, trade["id"])
 
-            # Increment candle counter
+            # Increment candle counter (retained for dashboard display)
             conn.cursor().execute(
                 "UPDATE trades SET candles_open = candles_open + 1 WHERE id = ?",
                 (trade["id"],)
@@ -840,9 +863,18 @@ def monitor_open_trades(
                 closed_trades.append(closed)
                 continue
 
-            # Check time stop
-            time_limit = TIME_STOP_CANDLES.get(timeframe, 30)
-            if trade["candles_open"] >= time_limit:
+            # FIX v3.6: Time stop based on elapsed wall-clock time.
+            # Uses entry_time from trades table to calculate hours elapsed.
+            # TIME_STOP_HOURS: 1H=30h, 4H=120h, 1D=240h
+            entry_time    = datetime.fromisoformat(trade["entry_time"])
+            elapsed_hours = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
+            time_limit_hours = TIME_STOP_HOURS.get(timeframe, 30)
+
+            if elapsed_hours >= time_limit_hours:
+                logger.info(
+                    f"Time stop: {symbol.replace('/USDT:USDT', '')} | "
+                    f"{timeframe} | Elapsed: {elapsed_hours:.1f}h / {time_limit_hours}h"
+                )
                 closed = close_trade(
                     conn, trade, current_price,
                     "time_stop", cooldown_tracker
