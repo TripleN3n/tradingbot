@@ -1,38 +1,25 @@
 # =============================================================================
 # APEX — Adaptive Per-token Execution Strategy Engine
 # bot/trade_manager.py — Trade Execution & Management
-# Version 3.6 — Time-based time stop + cooldown after time_stop
+# Version 3.7 — Exit-type based cooldown
 # =============================================================================
-# CHANGES FROM v3.2:
-#
-# monitor_open_trades():
-#   FIXED: Time stop was counting 1H bot cycles regardless of the token's
-#   assigned timeframe. A 1D token with TIME_STOP_CANDLES["1d"]=10 would
-#   exit after 10 *hours* (10 bot cycles), not 10 days. This caused CFX
-#   (1D token) to time-stop after 4 hours and immediately re-enter the
-#   same stale signal, bleeding capital in a loop (4 consecutive losses
-#   on Apr 8, ~$135 total).
-#
-#   FIX: Replaced candle counter check with time-elapsed check.
-#   TIME_STOP_HOURS maps each timeframe to the correct real-world duration:
-#     1H  → 30 hours  (30 × 1H candles)
-#     4H  → 120 hours (30 × 4H candles = 5 days)
-#     1D  → 240 hours (10 × 1D candles = 10 days)
-#   candles_open counter is retained for dashboard display only.
+# CHANGES FROM v3.6:
 #
 # close_trade():
-#   FIXED: Cooldown was only set after stop_loss exits. After a time_stop,
-#   no cooldown was applied — the slot released and the same stale candle
-#   signal immediately re-fired. Cooldown now triggers on both stop_loss
-#   and time_stop exits.
+#   FIXED: Cooldown now applies to ALL exit types including take_profit.
+#   Previously only stop_loss and time_stop triggered cooldown.
+#   Updated set_cooldown() call to pass exit reason instead of timeframe —
+#   cooldown duration is now determined by exit type (v3.7 filters.py):
+#     stop_loss:   4 candles
+#     time_stop:   2 candles
+#     take_profit: 1 candle
+#
+# Version 3.6 changes retained:
+#   Time stop now time-elapsed based (TIME_STOP_HOURS).
+#   Cooldown fires after both stop_loss and time_stop.
 #
 # Version 3.2 changes retained:
 #   partial_pnl_usdt column and TP accounting fixes.
-# =============================================================================
-# RESPONSIBILITY:
-# Handles all trade lifecycle operations:
-# opening trades, managing trailing SL/TP, closing trades.
-# Single source of truth for all trade state in trades.db.
 # =============================================================================
 
 import sqlite3
@@ -48,22 +35,10 @@ from bot.config import (
 )
 from bot.data_feed import get_exchange
 
-# =============================================================================
-# LOGGING
-# =============================================================================
-
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# TIME STOP DURATION MAP
-# FIX v3.6: Time stop is now time-elapsed based, not candle-count based.
-# candles_open increments every 1H bot cycle regardless of token timeframe,
-# so using it as a time stop gate was incorrect for 4H and 1D tokens.
-#
-# Mapping: timeframe → total hours before time stop triggers
-#   1H:  30 candles × 1H  = 30 hours
-#   4H:  30 candles × 4H  = 120 hours (5 days)
-#   1D:  10 candles × 24H = 240 hours (10 days)
+# TIME STOP DURATION MAP (v3.6)
 # =============================================================================
 
 TIME_STOP_HOURS = {
@@ -78,7 +53,6 @@ TIME_STOP_HOURS = {
 # =============================================================================
 
 def init_trades_db(conn: sqlite3.Connection):
-    """Create trades database tables if they don't exist."""
     c = conn.cursor()
 
     c.execute("""
@@ -89,8 +63,6 @@ def init_trades_db(conn: sqlite3.Connection):
             tier                TEXT NOT NULL,
             timeframe           TEXT NOT NULL,
             status              TEXT NOT NULL DEFAULT 'open',
-
-            -- Entry
             entry_price         REAL NOT NULL,
             entry_price_leg2    REAL,
             avg_entry_price     REAL NOT NULL,
@@ -99,39 +71,27 @@ def init_trades_db(conn: sqlite3.Connection):
             quantity_leg2       REAL,
             position_size_usdt  REAL NOT NULL,
             leverage            INTEGER NOT NULL,
-
-            -- Risk levels
             stop_loss           REAL NOT NULL,
             take_profit         REAL NOT NULL,
             sl_distance         REAL NOT NULL,
             atr_at_entry        REAL NOT NULL,
             rrr                 REAL NOT NULL,
-
-            -- Trailing state
             trailing_sl         REAL NOT NULL,
             at_breakeven        INTEGER DEFAULT 0,
             tier1_tp_hit        INTEGER DEFAULT 0,
             tier2_tp_hit        INTEGER DEFAULT 0,
             quantity_remaining  REAL NOT NULL,
-
-            -- Exit
             exit_price          REAL,
             exit_reason         TEXT,
             pnl_usdt            REAL,
             pnl_pct             REAL,
-
-            -- Partial TP accumulator
             partial_pnl_usdt    REAL DEFAULT 0,
-
-            -- Metadata
             signal_score        REAL,
             confluence_count    INTEGER,
             candles_open        INTEGER DEFAULT 0,
             entry_time          TEXT NOT NULL,
             leg2_entry_time     TEXT,
             exit_time           TEXT,
-
-            -- Leg 2 tracking
             leg2_pending        INTEGER DEFAULT 1,
             leg2_candles_waited INTEGER DEFAULT 0
         )
@@ -149,19 +109,17 @@ def init_trades_db(conn: sqlite3.Connection):
 
     conn.commit()
 
-    # Safe migration: add partial_pnl_usdt to existing tables that predate this column.
     try:
         c.execute("ALTER TABLE trades ADD COLUMN partial_pnl_usdt REAL DEFAULT 0")
         conn.commit()
         logger.info("Trades DB: added partial_pnl_usdt column (schema migration)")
     except Exception:
-        pass  # Column already exists — no action needed
+        pass
 
     logger.info("Trades database initialized")
 
 
 def get_trades_conn() -> sqlite3.Connection:
-    """Return connection to trades database."""
     from pathlib import Path
     Path(DB["trades"]).parent.mkdir(parents=True, exist_ok=True)
     return sqlite3.connect(DB["trades"], check_same_thread=False)
@@ -172,7 +130,6 @@ def get_trades_conn() -> sqlite3.Connection:
 # =============================================================================
 
 def get_open_trades(conn: sqlite3.Connection) -> list:
-    """Return all currently open trades as list of dicts."""
     c = conn.cursor()
     c.execute("SELECT * FROM trades WHERE status = 'open'")
     columns = [d[0] for d in c.description]
@@ -180,7 +137,6 @@ def get_open_trades(conn: sqlite3.Connection) -> list:
 
 
 def get_trade(conn: sqlite3.Connection, trade_id: int) -> Optional[dict]:
-    """Return a specific trade by ID."""
     c = conn.cursor()
     c.execute("SELECT * FROM trades WHERE id = ?", (trade_id,))
     row = c.fetchone()
@@ -191,7 +147,6 @@ def get_trade(conn: sqlite3.Connection, trade_id: int) -> Optional[dict]:
 
 
 def get_closed_trades(conn: sqlite3.Connection, limit: int = 100) -> list:
-    """Return most recent closed trades."""
     c = conn.cursor()
     c.execute(
         "SELECT * FROM trades WHERE status = 'closed' ORDER BY exit_time DESC LIMIT ?",
@@ -202,7 +157,6 @@ def get_closed_trades(conn: sqlite3.Connection, limit: int = 100) -> list:
 
 
 def get_capital(conn: sqlite3.Connection) -> float:
-    """Return current capital from portfolio table."""
     c = conn.cursor()
     c.execute("SELECT capital FROM portfolio ORDER BY id DESC LIMIT 1")
     row = c.fetchone()
@@ -210,7 +164,6 @@ def get_capital(conn: sqlite3.Connection) -> float:
 
 
 def update_capital(conn: sqlite3.Connection, capital: float, deployed: float = 0):
-    """Update portfolio capital record."""
     c = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
     c.execute(
@@ -231,10 +184,6 @@ def _place_order(
     order_type: str = "market",
     price: float = None,
 ) -> Optional[dict]:
-    """
-    Place an order on the exchange.
-    In paper trading mode, simulates the order fill at current price.
-    """
     if PAPER_TRADING:
         return {
             "id":     f"paper_{datetime.now(timezone.utc).timestamp()}",
@@ -258,7 +207,6 @@ def _place_order(
 
 
 def _set_leverage(symbol: str, leverage: int):
-    """Set leverage for a symbol. Only needed for live trading."""
     if PAPER_TRADING:
         return
     try:
@@ -269,22 +217,13 @@ def _set_leverage(symbol: str, leverage: int):
 
 
 # =============================================================================
-# TRADE ENTRY — TWO LEG SCALED ENTRY
+# TRADE ENTRY
 # =============================================================================
 
 def open_trade(
     conn: sqlite3.Connection,
     signal: dict,
 ) -> Optional[int]:
-    """
-    Open a new trade using two-leg scaled entry.
-
-    Leg 1: Enter 60% of position at signal candle close price.
-    Leg 2: Enter remaining 40% on pullback to EMA within 3 candles.
-           If no pullback → enter at original price on next candle.
-
-    Returns trade_id if successful, None on failure.
-    """
     symbol         = signal["symbol"]
     direction      = signal["direction"]
     tier           = signal["tier"]
@@ -303,7 +242,6 @@ def open_trade(
 
     _set_leverage(symbol, leverage)
 
-    # Leg 1 — 60% of position
     qty_leg1 = round(quantity_total * ENTRY["leg1_pct"], 6)
 
     order1 = _place_order(symbol, direction, qty_leg1, "market", entry_price)
@@ -396,14 +334,6 @@ def process_leg2(
     current_price: float,
     ema_price: float,
 ) -> bool:
-    """
-    Process Leg 2 entry for a pending two-leg trade.
-
-    Triggers if price pulls back to EMA within 3 candles,
-    or at original entry price after 3 candles without pullback.
-
-    Returns True if Leg 2 was entered.
-    """
     if not trade["leg2_pending"]:
         return False
 
@@ -478,7 +408,7 @@ def process_leg2(
 
 
 # =============================================================================
-# TRADE MANAGEMENT — TRAILING SL/TP
+# TRAILING SL/TP
 # =============================================================================
 
 def update_trailing_sl(
@@ -487,16 +417,6 @@ def update_trailing_sl(
     current_price: float,
     current_atr: float,
 ) -> dict:
-    """
-    Update trailing stop loss based on current price.
-
-    Rules:
-    - At 1× risk in profit → move SL to breakeven
-    - At 1.5× risk in profit → trail SL to lock 0.5× risk as profit
-    - After primary TP hit → trail with 1× ATR
-
-    Returns updated trade dict.
-    """
     trade_id     = trade["id"]
     direction    = trade["direction"]
     avg_entry    = trade["avg_entry_price"]
@@ -524,7 +444,7 @@ def update_trailing_sl(
             atr_trail = current_price - (current_atr * TP["trail_atr_multiplier"])
             new_sl    = max(new_sl, atr_trail)
 
-    else:  # short
+    else:
         profit_dist = avg_entry - current_price
 
         if not at_breakeven and profit_dist >= sl_distance * TRAILING_SL["breakeven_at"]:
@@ -557,16 +477,6 @@ def check_primary_tp(
     current_high: float,
     current_low: float,
 ) -> bool:
-    """
-    Tiered TP exit strategy:
-    - Stage 1: Close 40% at 1.5× RRR
-    - Stage 2: Close 30% at 2.0× RRR
-    - Remaining 30%: trail with 1.5× ATR
-
-    After each partial close, PnL is:
-    1. Accumulated to partial_pnl_usdt in the trades table.
-    2. Immediately reflected in capital via update_capital().
-    """
     trade_id      = trade["id"]
     direction     = trade["direction"]
     avg_entry     = trade["avg_entry_price"]
@@ -593,7 +503,6 @@ def check_primary_tp(
     close_side = "sell" if direction == "long" else "buy"
     hit_any    = False
 
-    # Stage 1 — close 40% at 1.5× RRR
     if not tier1_hit:
         t1_hit = (
             (direction == "long"  and current_high >= tp1) or
@@ -625,14 +534,13 @@ def check_primary_tp(
                     f"Remaining: {new_qty:.6f} ({int((1 - t1_pct) * 100)}%)"
                 )
 
-                trade["tier1_tp_hit"]      = 1
-                trade["quantity_remaining"] = new_qty
-                trade["partial_pnl_usdt"]  = trade.get("partial_pnl_usdt", 0) + pnl
-                qty_remaining               = new_qty
-                tier1_hit                   = True
-                hit_any                     = True
+                trade["tier1_tp_hit"]       = 1
+                trade["quantity_remaining"]  = new_qty
+                trade["partial_pnl_usdt"]   = trade.get("partial_pnl_usdt", 0) + pnl
+                qty_remaining                = new_qty
+                tier1_hit                    = True
+                hit_any                      = True
 
-    # Stage 2 — close 30% at 2.0× RRR
     if tier1_hit and not tier2_hit:
         t2_hit = (
             (direction == "long"  and current_high >= tp2) or
@@ -678,22 +586,15 @@ def close_trade(
     """
     Close a trade and record final PnL.
 
-    total_pnl = partial_pnl_usdt  (stage1 + stage2 TP profits)
-              + remaining_pnl     (final close at exit_price)
+    FIX v3.7: Cooldown now applies to ALL exit types including take_profit.
+    set_cooldown() receives exit reason instead of timeframe — duration is
+    determined by exit type:
+        stop_loss:   4 candles
+        time_stop:   2 candles
+        take_profit: 1 candle
 
-    FIX v3.6: Cooldown now applied after both stop_loss AND time_stop exits.
-    Previously only stop_loss triggered cooldown — after a time_stop the slot
-    released immediately and the same stale candle signal re-fired on the
-    next bot cycle, causing repeated entries into losing conditions.
-
-    Args:
-        conn:             Database connection
-        trade:            Trade dict from get_open_trades()
-        exit_price:       Price at which trade exits
-        reason:           'stop_loss', 'take_profit', 'time_stop', 'manual'
-        cooldown_tracker: Optional dict to update cooldown after SL/time_stop
-
-    Returns updated trade dict with PnL.
+    FIX v3.6: Cooldown fires after stop_loss AND time_stop (previously SL only).
+    Time stop is time-elapsed based via TIME_STOP_HOURS.
     """
     trade_id      = trade["id"]
     direction     = trade["direction"]
@@ -702,7 +603,6 @@ def close_trade(
     qty_remaining = trade["quantity_remaining"]
     position_usdt = trade["position_size_usdt"]
 
-    # Place closing order
     close_side = "sell" if direction == "long" else "buy"
     order = _place_order(symbol, close_side, qty_remaining, "market", exit_price)
 
@@ -710,13 +610,11 @@ def close_trade(
         logger.error(f"Close order failed for {symbol} — retrying...")
         order = _place_order(symbol, close_side, qty_remaining, "market", exit_price)
 
-    # PnL on the remaining open quantity
     if direction == "long":
         remaining_pnl = (exit_price - avg_entry) * qty_remaining
     else:
         remaining_pnl = (avg_entry - exit_price) * qty_remaining
 
-    # Include PnL from partial TP closes in total
     partial_pnl = trade.get("partial_pnl_usdt", 0) or 0
     total_pnl   = remaining_pnl + partial_pnl
     pnl_pct     = (total_pnl / position_usdt) * 100
@@ -735,18 +633,15 @@ def close_trade(
     """, (exit_price, reason, round(total_pnl, 4), round(pnl_pct, 4), now, trade_id))
     conn.commit()
 
-    # Update capital with remaining quantity close PnL only.
-    # Partial TP capital updates happened in check_primary_tp() already.
     capital     = get_capital(conn)
     new_capital = capital + remaining_pnl
     update_capital(conn, new_capital)
 
-    # FIX v3.6: Apply cooldown after stop_loss OR time_stop.
-    # time_stop means the setup failed to move — same stale signal should
-    # not re-fire immediately on the next bot cycle.
-    if reason in ("stop_loss", "time_stop") and cooldown_tracker is not None:
+    # FIX v3.7: Cooldown applies to all exit types.
+    # Pass reason to set_cooldown() — duration determined by exit type.
+    if cooldown_tracker is not None:
         from bot.filters import set_cooldown
-        set_cooldown(cooldown_tracker, symbol, trade["timeframe"])
+        set_cooldown(cooldown_tracker, symbol, reason)
 
     logger.info(
         f"Trade closed: {symbol.replace('/USDT:USDT', '')} "
@@ -788,7 +683,7 @@ def close_trade(
 
 
 # =============================================================================
-# TRADE MONITORING — CHECK ALL OPEN TRADES
+# TRADE MONITORING
 # =============================================================================
 
 def monitor_open_trades(
@@ -797,17 +692,6 @@ def monitor_open_trades(
     ohlcv_data: dict,
     cooldown_tracker: dict,
 ) -> tuple:
-    """
-    Monitor all open trades for SL hits, TP hits, and time stops.
-    Called every bot cycle.
-
-    FIX v3.6: Time stop now uses time-elapsed (hours) rather than
-    candles_open counter. candles_open increments every 1H bot cycle
-    regardless of the token's assigned timeframe, so a 1D token would
-    incorrectly time-stop after 10 *hours* instead of 10 *days*.
-
-    Returns (closed_trades, updated_cooldown_tracker)
-    """
     closed_trades = []
 
     for trade in open_trades:
@@ -825,23 +709,18 @@ def monitor_open_trades(
         current_low   = latest["low"]
         current_atr   = latest.get("atr", trade["atr_at_entry"])
         ema_price     = latest.get("ema_fast", current_price)
-
-        direction   = trade["direction"]
+        direction     = trade["direction"]
 
         try:
-            # Process Leg 2 if pending
             if trade.get("leg2_pending"):
                 process_leg2(conn, trade, current_price, ema_price)
                 trade = get_trade(conn, trade["id"])
 
-            # Update trailing SL
             trade = update_trailing_sl(conn, trade, current_price, current_atr)
 
-            # Check primary TP (partial closes handled inside)
             check_primary_tp(conn, trade, current_high, current_low)
             trade = get_trade(conn, trade["id"])
 
-            # Increment candle counter (retained for dashboard display)
             conn.cursor().execute(
                 "UPDATE trades SET candles_open = candles_open + 1 WHERE id = ?",
                 (trade["id"],)
@@ -849,7 +728,6 @@ def monitor_open_trades(
             conn.commit()
             trade = get_trade(conn, trade["id"])
 
-            # Check SL hit
             sl_hit = (
                 (direction == "long"  and current_low  <= trade["trailing_sl"]) or
                 (direction == "short" and current_high >= trade["trailing_sl"])
@@ -863,11 +741,9 @@ def monitor_open_trades(
                 closed_trades.append(closed)
                 continue
 
-            # FIX v3.6: Time stop based on elapsed wall-clock time.
-            # Uses entry_time from trades table to calculate hours elapsed.
-            # TIME_STOP_HOURS: 1H=30h, 4H=120h, 1D=240h
-            entry_time    = datetime.fromisoformat(trade["entry_time"])
-            elapsed_hours = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
+            # FIX v3.6: Time stop uses elapsed wall-clock hours
+            entry_time       = datetime.fromisoformat(trade["entry_time"])
+            elapsed_hours    = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
             time_limit_hours = TIME_STOP_HOURS.get(timeframe, 30)
 
             if elapsed_hours >= time_limit_hours:
@@ -882,7 +758,6 @@ def monitor_open_trades(
                 closed_trades.append(closed)
                 continue
 
-            # Check if trailing 30% hit trailing SL after stage2 TP
             if trade.get("tier2_tp_hit", 0):
                 trail_sl_hit = (
                     (direction == "long"  and current_low  <= trade["trailing_sl"]) or
@@ -902,11 +777,10 @@ def monitor_open_trades(
 
 
 # =============================================================================
-# PERFORMANCE STATS — Used by dashboard
+# PERFORMANCE STATS
 # =============================================================================
 
 def get_performance_stats(conn: sqlite3.Connection) -> dict:
-    """Calculate performance statistics from closed trades."""
     c = conn.cursor()
 
     c.execute("SELECT pnl_usdt, pnl_pct FROM trades WHERE status = 'closed'")

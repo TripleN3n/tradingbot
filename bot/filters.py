@@ -1,35 +1,21 @@
 # =============================================================================
 # APEX — Adaptive Per-token Execution Strategy Engine
 # bot/filters.py — Entry Filters
-# Version 3.3 — F&G hard block removed (lagging indicator, redundant with confluence)
+# Version 3.7 — Exit-type based cooldown
 # =============================================================================
-# CHANGES FROM v3.2:
-# - filter_fear_greed(): Function retained but removed from run_all_filters().
-#   F&G is a lagging indicator — redundant with real-time technical confluence.
-#   RSI, EMA, Volume already capture sentiment in real time.
-#   Hard blocking longs during Extreme Fear caused missed recoveries.
-# =============================================================================
-# CHANGES FROM v3.1:
-# - filter_session(): Now tier-aware per strategy spec.
-#   Tier1/Tier2 allowed in Asian session at 50% position size (was fully blocked).
-#   Tier3 still fully blocked in Asian session.
-#   Timeframe parameter added for future-proofing and logging clarity.
-# - run_all_filters(): Passes timeframe to filter_session().
-# =============================================================================
-# All filters are independent and pluggable.
-# Add a new filter: add function + one line in run_all_filters(). Done.
-# Disable a filter: set "enabled": False in config.py. Nothing else changes.
+# CHANGES FROM v3.3:
+# - set_cooldown(): Now accepts exit_reason instead of timeframe.
+#   Cooldown duration is determined by exit type, not timeframe:
+#     stop_loss:   4 candles
+#     time_stop:   2 candles
+#     take_profit: 1 candle
+#   Values read from COOLDOWN_CANDLES in config.py.
+# - filter_cooldown(): Updated message to reflect exit-type cooldown.
+# - decrement_cooldowns(): Unchanged.
 #
-# FILTERS:
-# 1. Candle close confirmation
-# 2. Volume filter
-# 3. Liquidity filter
-# 4. Funding rate filter
-# 5. Fear & Greed filter — RETAINED but NOT ACTIVE (removed from run_all_filters)
-# 6. BTC trend filter — matches token's entry timeframe exactly
-# 7. Correlation filter
-# 8. Session filter — tier-aware Asian session handling
-# 9. Cooldown filter
+# Version 3.3 changes retained:
+# - filter_fear_greed(): Retained but NOT active in run_all_filters().
+# - filter_session(): Tier-aware Asian session handling.
 # =============================================================================
 
 import pandas as pd
@@ -38,7 +24,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from bot.config import FILTERS, TIERS, BTC_FILTER
+from bot.config import FILTERS, TIERS, BTC_FILTER, COOLDOWN_CANDLES
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +110,6 @@ def filter_funding_rate(funding_rate: float, direction: str) -> FilterResult:
 # =============================================================================
 # FILTER 5 — FEAR & GREED FILTER
 # RETAINED but NOT ACTIVE — removed from run_all_filters()
-# Reason: F&G is lagging — price recovers before F&G reflects it.
-# Real-time confluence (RSI, EMA, Volume) already captures sentiment.
-# Re-enable by adding back to filter_checks in run_all_filters() if needed.
 # =============================================================================
 
 def filter_fear_greed(fear_greed_value: int, direction: str) -> FilterResult:
@@ -142,7 +125,7 @@ def filter_fear_greed(fear_greed_value: int, direction: str) -> FilterResult:
 
 
 # =============================================================================
-# FILTER 6 — BTC TREND FILTER (v3.1 — timeframe-matched)
+# FILTER 6 — BTC TREND FILTER
 # =============================================================================
 
 def filter_btc_trend(
@@ -152,20 +135,6 @@ def filter_btc_trend(
     tier: str = "tier3",
     confluence_count: int = 0,
 ) -> FilterResult:
-    """
-    BTC trend filter — checks BTC direction on the SAME timeframe as token entry.
-
-    1H token → checks btc_trend["1h"]
-    4H token → checks btc_trend["4h"]
-    1D token → checks btc_trend["1d"]
-
-    Rules:
-    - BTC neutral on that timeframe → trade allowed
-    - BTC aligned with trade direction → trade allowed
-    - BTC opposed to trade direction:
-        Tier1 / Tier2 → soft override: allowed if confluence_count >= 4
-        Tier3         → soft override: allowed if confluence_count >= 5
-    """
     if not BTC_FILTER.get("enabled", True):
         return FilterResult(True, "BTC filter disabled")
 
@@ -182,7 +151,6 @@ def filter_btc_trend(
     if aligned:
         return FilterResult(True, f"BTC {timeframe} aligned: {btc_direction}")
 
-    # BTC conflict — check soft override by tier
     if tier in ("tier1", "tier2") and confluence_count >= 4:
         return FilterResult(
             True,
@@ -197,7 +165,8 @@ def filter_btc_trend(
 
     return FilterResult(
         False,
-        f"BTC {timeframe} conflict: BTC={btc_direction}, signal={direction} (confluence {confluence_count} insufficient for override)"
+        f"BTC {timeframe} conflict: BTC={btc_direction}, signal={direction} "
+        f"(confluence {confluence_count} insufficient for override)"
     )
 
 
@@ -246,24 +215,10 @@ def filter_correlation(
 
 
 # =============================================================================
-# FILTER 8 — SESSION FILTER (v3.2 — tier-aware)
+# FILTER 8 — SESSION FILTER
 # =============================================================================
 
 def filter_session(tier: str, timeframe: str = "1h") -> FilterResult:
-    """
-    Session-based position sizing filter.
-
-    FIX from v3.1: Now tier-aware per strategy spec.
-    - US session (13:00–21:00 UTC):   All tiers, full size.
-    - Euro session (07:00–13:00 UTC): All tiers, full size.
-    - Asian session (all other hours): Tier-dependent:
-        - Tier1 / Tier2: 50% position size (reduced, but allowed)
-        - Tier3:         Skipped entirely
-
-    Previously, Asian session blocked ALL tiers with size_multiplier=0.0.
-    This inadvertently deadlocked 1D-timeframe tokens whose signals
-    only fired at midnight UTC (hour 0 = Asian session).
-    """
     if not FILTERS["session"]["enabled"]:
         return FilterResult(True, "disabled", size_multiplier=1.0)
 
@@ -272,16 +227,12 @@ def filter_session(tier: str, timeframe: str = "1h") -> FilterResult:
     euro_session = FILTERS["session"]["euro_session"]
     asian_cfg    = FILTERS["session"]["asian_session"]
 
-    # US session: full size, all tiers
     if us_session["start"] <= hour < us_session["end"]:
         return FilterResult(True, f"US session (hour {hour}:xx UTC)", size_multiplier=1.0)
 
-    # Euro session: full size, all tiers
     if euro_session["start"] <= hour < euro_session["end"]:
         return FilterResult(True, f"Euro session (hour {hour}:xx UTC)", size_multiplier=1.0)
 
-    # Asian / off-hours session (hours 0–6 and 21–23 UTC)
-    # Resolve the size multiplier for this tier
     if tier == "tier1":
         size = asian_cfg.get("tier1_size", 0.5)
     elif tier == "tier2":
@@ -322,19 +273,6 @@ def run_all_filters(
     cooldown_tracker: dict,
     timeframe: str,
 ) -> dict:
-    """
-    Run all active entry filters in sequence.
-    Returns dict with passed, size_multiplier, failures, details.
-
-    BTC filter uses the token's entry timeframe to check the matching BTC direction.
-    Session filter is now tier-aware — Asian session allowed for tier1/2 at 50% size.
-    F&G filter removed from active checks (v3.3) — lagging, redundant with confluence.
-
-    To add a new filter:
-    1. Create a filter function above
-    2. Add one line in filter_checks below
-    Nothing else changes.
-    """
     results         = {}
     size_multiplier = 1.0
     failures        = []
@@ -411,11 +349,12 @@ def run_all_filters(
 # =============================================================================
 
 def filter_cooldown(symbol: str, cooldown_tracker: dict) -> FilterResult:
+    """Block entry if token is in cooldown after a recent exit."""
     if not FILTERS["cooldown"]["enabled"]:
         return FilterResult(True, "disabled")
     remaining = cooldown_tracker.get(symbol, 0)
     if remaining > 0:
-        return FilterResult(False, f"Cooldown: {remaining} candles after SL")
+        return FilterResult(False, f"Cooldown active: {remaining} candles remaining")
     return FilterResult(True, "No cooldown")
 
 
@@ -424,16 +363,24 @@ def decrement_cooldowns(cooldown_tracker: dict) -> dict:
     return {s: r - 1 for s, r in cooldown_tracker.items() if r > 1}
 
 
-def set_cooldown(cooldown_tracker: dict, symbol: str, timeframe: str) -> dict:
-    """Set cooldown after SL hit. Duration is timeframe-aware."""
-    candles_cfg = FILTERS["cooldown"]["candles_after_sl"]
-    if isinstance(candles_cfg, dict):
-        tf      = str(timeframe).lower() if timeframe else "1h"
-        candles = candles_cfg.get(tf, candles_cfg.get("1h", 4))
-    else:
-        candles = candles_cfg
+def set_cooldown(cooldown_tracker: dict, symbol: str, exit_reason: str) -> dict:
+    """
+    Set cooldown after a trade closes.
+
+    FIX v3.7: Cooldown is now exit-type based, not timeframe-based.
+    Duration reflects how strongly the exit signals market hostility:
+        stop_loss:   4 candles — market moved against you, stay out longer
+        time_stop:   2 candles — setup stale, wait for fresh conditions
+        take_profit: 1 candle  — setup worked, minimal re-entry pause
+
+    Args:
+        cooldown_tracker: In-memory cooldown state dict
+        symbol:           Token symbol
+        exit_reason:      'stop_loss', 'time_stop', or 'take_profit'
+    """
+    candles = COOLDOWN_CANDLES.get(exit_reason, COOLDOWN_CANDLES.get("stop_loss", 4))
     cooldown_tracker[symbol] = candles
-    logger.debug(f"Cooldown set: {symbol} — {candles} {timeframe} candles")
+    logger.debug(f"Cooldown set: {symbol} — {candles} candles ({exit_reason})")
     return cooldown_tracker
 
 # __APEX_LOGGER_V1__

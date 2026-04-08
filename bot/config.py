@@ -1,15 +1,17 @@
 # =============================================================================
 # APEX — Adaptive Per-token Execution Strategy Engine
 # bot/config.py — Single Source of Truth
-# Version 3.1 — Parameter corrections and alignment to strategy spec
+# Version 3.7 — Exit-type based cooldown
 # =============================================================================
-# CHANGES FROM v3.0:
-# - TIME_STOP_CANDLES["1h"]: 24 → 30 (spec alignment)
-# - TIERS min_rrr: tier1=2.0, tier2=1.75, tier3=1.5 (spec alignment)
-# - DRAWDOWN thresholds: 15/25/40% → 20/35/50% (spec alignment)
-# - RSI zone filter short_min_rsi: 40 → 28 (too aggressive in bearish markets)
-# - Price position filter max_ema_distance: 3% → 8% (too tight for trends)
-# - Session filter Asian session: now tier-aware per spec (50% for tier1/2)
+# CHANGES FROM v3.1:
+# - COOLDOWN_CANDLES: Replaces SL_COOLDOWN_CANDLES and timeframe-based cooldown.
+#   Cooldown is now exit-type aware, not timeframe-aware:
+#     stop_loss:   4 candles — market moved against you, wait longer
+#     time_stop:   2 candles — setup stale, wait for fresh conditions
+#     take_profit: 1 candle  — setup worked, minimal pause before re-entry
+#   This applies uniformly across all timeframes.
+#   Old SL_COOLDOWN_CANDLES (1h:4, 4h:6, 1d:3) removed.
+#   FILTERS["cooldown"]["candles_after_sl"] updated to match.
 # =============================================================================
 # HOW TO USE THIS FILE:
 # Every parameter for the entire system lives here.
@@ -73,24 +75,17 @@ MAX_LEVERAGE     = 2          # Hard maximum — never exceed
 # =============================================================================
 # 4. TIER CONFIGURATION
 # =============================================================================
-# Tiers define signal confidence, slot count, RRR.
-# To add a new tier: add an entry here. Nothing else needs to change.
-#
-# FIX: min_rrr now correctly differentiated by tier per strategy spec:
-#   Tier1 (highest confidence) → 1:2.0 RRR — best signals deserve best targets
-#   Tier2 (medium confidence)  → 1:1.75 RRR
-#   Tier3 (lower confidence)   → 1:1.5 RRR — minimum acceptable RRR
 
 TIERS = {
     "tier1": {
         "name":               "High Confidence",
-        "score_percentile":   75,        # Top 25% backtest scores
+        "score_percentile":   75,
         "max_slots":          4,
         "capital_pct":        0.40,
-        "min_rrr":            2.0,       # 1:2 RRR — highest confidence, widest TP
+        "min_rrr":            2.0,
         "btc_filter":         "strict",
-        "min_confluence":     4,         # 4 of 6 indicators must agree
-        "asian_session_size": 0.5,       # 50% position size in Asian session
+        "min_confluence":     4,
+        "asian_session_size": 0.5,
         "leverage":           2,
     },
     "tier2": {
@@ -98,10 +93,10 @@ TIERS = {
         "score_percentile":   50,
         "max_slots":          3,
         "capital_pct":        0.30,
-        "min_rrr":            1.75,      # 1:1.75 RRR
+        "min_rrr":            1.75,
         "btc_filter":         "strict",
         "min_confluence":     4,
-        "asian_session_size": 0.5,       # 50% position size in Asian session
+        "asian_session_size": 0.5,
         "leverage":           2,
     },
     "tier3": {
@@ -109,11 +104,11 @@ TIERS = {
         "score_percentile":   25,
         "max_slots":          2,
         "capital_pct":        0.25,
-        "min_rrr":            1.5,       # 1:1.5 RRR — minimum acceptable
+        "min_rrr":            1.5,
         "btc_filter":         "strict",
         "min_confluence":     3,
-        "asian_session_size": 0.0,       # Skip Asian session entirely
-        "leverage":           1,         # Conservative 1x for Tier 3
+        "asian_session_size": 0.0,
+        "leverage":           1,
     },
 }
 
@@ -135,13 +130,10 @@ MTF_CONFIG = {
 TIMEFRAME_TIEBREAKER_PCT  = 0.05
 TIMEFRAME_PRIORITY        = ["1h", "4h", "1d"]
 
-# Time stop rules per entry timeframe.
-# FIX: 1H corrected from 24 to 30 candles per strategy spec (30 hours max).
-# 4H: 12 candles = 2 days. 1D: 7 candles = 7 days.
 TIME_STOP_CANDLES = {
-    "1h": 30,    # 30 hours max — FIX: was 24, spec says 30
-    "4h": 12,    # 2 days max
-    "1d": 7,     # 7 days max
+    "1h": 30,
+    "4h": 12,
+    "1d": 7,
 }
 
 # =============================================================================
@@ -188,26 +180,22 @@ VOLUME = {
 
 SL = {
     "atr_period":     14,
-    "atr_multiplier": 1.5,      # SL = 1.5× ATR minimum distance
-    "min_pct":        0.015,    # Hard floor: SL must be at least 1.5% of entry
-    "max_pct":        0.03,     # Hard cap: SL cannot exceed 3% of entry
+    "atr_multiplier": 1.5,
+    "min_pct":        0.015,
+    "max_pct":        0.03,
 }
 
 TRAILING_SL = {
-    "breakeven_at": 1.0,    # Move SL to breakeven at 1x risk in profit
-    "trail_at":     1.5,    # Start trailing at 1.5x risk in profit
-    "trail_lock":   0.5,    # Lock in 0.5x risk as minimum profit
+    "breakeven_at": 1.0,
+    "trail_at":     1.5,
+    "trail_lock":   0.5,
 }
 
-# Two-stage TP system (applied to all tiers):
-# Stage 1: Close 40% of position at 1.5x RRR — quick profit capture
-# Stage 2: Close 30% of position at 2.0x RRR — let winners run
-# Remaining 30%: Trail with 1.5x ATR until time stop or trailing SL hit
 TP = {
     "tier1_close_pct":      0.40,
-    "tier1_rrr":            1.5,    # First partial exit at 1.5x risk
+    "tier1_rrr":            1.5,
     "tier2_close_pct":      0.30,
-    "tier2_rrr":            2.0,    # Second partial exit at 2.0x risk
+    "tier2_rrr":            2.0,
     "trail_pct":            0.30,
     "trail_atr_multiplier": 1.5,
 }
@@ -218,21 +206,31 @@ ENTRY = {
     "leg2_candle_window": 3,
 }
 
-SL_COOLDOWN_CANDLES = {
-    "1h": 4,
-    "4h": 6,
-    "1d": 3,
+# =============================================================================
+# COOLDOWN CONFIGURATION
+# FIX v3.7: Cooldown is now exit-type based, not timeframe-based.
+# Different exits tell you different things about market conditions:
+#   stop_loss:   4 candles — market moved against you hard, stay out longer
+#   time_stop:   2 candles — setup went nowhere, wait for fresh candle conditions
+#   take_profit: 1 candle  — setup worked, minimal pause before re-entry
+# Applied uniformly across all timeframes (1H/4H/1D).
+# Old SL_COOLDOWN_CANDLES (1h:4, 4h:6, 1d:3) removed.
+# =============================================================================
+
+COOLDOWN_CANDLES = {
+    "stop_loss":   4,
+    "time_stop":   2,
+    "take_profit": 1,
 }
 
 # =============================================================================
 # 8. DRAWDOWN CIRCUIT BREAKERS
 # =============================================================================
-# FIX: Thresholds corrected to match strategy spec (was 15/25/40%).
 
 DRAWDOWN = {
-    "alert_pct": 0.20,   # 20% — Telegram alert, bot continues trading
-    "pause_pct": 0.35,   # 35% — Pause new entries, existing trades finish
-    "stop_pct":  0.50,   # 50% — Full stop, all trades closed at market
+    "alert_pct": 0.20,
+    "pause_pct": 0.35,
+    "stop_pct":  0.50,
 }
 
 # =============================================================================
@@ -274,18 +272,13 @@ FILTERS = {
 
     "session": {
         "enabled": True,
-        # Times in UTC
-        # FIX: Asian session is now tier-aware per strategy spec.
-        # Tier1/Tier2: 50% position size in Asian session (was blocked entirely).
-        # Tier3: Skip Asian session entirely (unchanged).
-        # 1D timeframe signals are exempt — daily candle is already closed.
         "us_session":    {"start": 13, "end": 21, "size_multiplier": 1.0},
         "euro_session":  {"start": 7,  "end": 13, "size_multiplier": 1.0},
         "asian_session": {
             "start": 0, "end": 7,
-            "tier1_size": 0.5,    # 50% position size — spec compliant
-            "tier2_size": 0.5,    # 50% position size — spec compliant
-            "tier3_size": 0.0,    # Tier3 fully blocked in Asian session
+            "tier1_size": 0.5,
+            "tier2_size": 0.5,
+            "tier3_size": 0.0,
         },
     },
 
@@ -294,12 +287,11 @@ FILTERS = {
     },
 
     "cooldown": {
-        "enabled":          True,
-        "candles_after_sl": {
-            "1h": 4,
-            "4h": 6,
-            "1d": 3,
-        },
+        "enabled": True,
+        # Exit-type based cooldown candles (v3.7)
+        # stop_loss=4, time_stop=2, take_profit=1
+        # See COOLDOWN_CANDLES above — this is the single source of truth
+        "candles": COOLDOWN_CANDLES,
     },
 
     "mtf_alignment": {
@@ -307,22 +299,15 @@ FILTERS = {
         "require_all": True,
     },
 
-    # FIX: short_min_rsi reduced from 40 to 28.
-    # At 40, the filter blocked ALL short signals in Extreme Fear conditions
-    # where RSI is typically 20–35. Shorts in the 28–40 RSI range are valid
-    # when trend confluence is confirmed on higher timeframes.
     "rsi_zone": {
-        "enabled":      True,
-        "long_max_rsi":  60,   # Don't enter long when RSI already above 60
-        "short_min_rsi": 28,   # Don't enter short when RSI already below 28
+        "enabled":       True,
+        "long_max_rsi":  60,
+        "short_min_rsi": 28,
     },
 
-    # FIX: max_ema_distance increased from 3% to 8%.
-    # In a trending market, price routinely sits 5–15% from the 20-period EMA.
-    # 3% was blocking entries precisely when trend momentum was clearest.
     "price_position": {
         "enabled":          True,
-        "max_ema_distance": 0.08,   # Price must be within 8% of fast EMA
+        "max_ema_distance": 0.08,
     },
 }
 
@@ -374,13 +359,12 @@ SCORING_WEIGHTS = {
     "sharpe_ratio":  0.10,
 }
 
-# v3.2: relaxed thresholds — bear-market short strategies can dip just below strict values
 SCORING_MINIMUMS = {
-    "expectancy":    0.0,    # Must be positive
-    "win_rate":      0.35,   # 35% minimum (was 38%)
-    "max_drawdown":  0.30,   # 30% max allowed (was 25%)
-    "profit_factor": 1.05,   # Minimum 1.05 (was 1.1)
-    "sharpe_ratio":  0.25,   # Minimum 0.25 (was 0.3)
+    "expectancy":    0.0,
+    "win_rate":      0.35,
+    "max_drawdown":  0.30,
+    "profit_factor": 1.05,
+    "sharpe_ratio":  0.25,
 }
 
 # =============================================================================
@@ -511,6 +495,7 @@ def get_config_dict() -> dict:
         "MAX_LEVERAGE":        MAX_LEVERAGE,
         "DRAWDOWN":            DRAWDOWN,
         "TIME_STOP_CANDLES":   TIME_STOP_CANDLES,
+        "COOLDOWN_CANDLES":    COOLDOWN_CANDLES,
         "GO_LIVE_CRITERIA":    GO_LIVE_CRITERIA,
         "PERFORMANCE_MONITOR": PERFORMANCE_MONITOR,
         "SCORING_MINIMUMS":    SCORING_MINIMUMS,
