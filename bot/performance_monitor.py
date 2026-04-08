@@ -26,7 +26,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from bot.config import PERFORMANCE_MONITOR, LOGS, DB
+from bot.config import PERFORMANCE_MONITOR, LOGS, DB, DRAWDOWN
 
 # =============================================================================
 # LOGGING
@@ -458,7 +458,6 @@ def check_go_live_criteria(conn: sqlite3.Connection) -> dict:
     }
 
 
-from bot.config import DRAWDOWN
 
 # =============================================================================
 # ENTRY POINT

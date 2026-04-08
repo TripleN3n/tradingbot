@@ -246,7 +246,11 @@ def run_weekly_refresh():
         # Trigger immediate backtest for new tokens
         _backtest_new_tokens(conn, added_symbols)
 
-    # Step 6 — Send Telegram alert
+    # Step 6 — Calculate final state (must precede apex_logger call that uses active_count)
+    after = get_universe_snapshot(conn)
+    active_count = sum(1 for v in after.values() if v["active"])
+
+    # Step 7 — Send Telegram alert
     send_universe_alert(added_symbols, dropped_symbols)
     try:
         from bot.config import apex_logger
@@ -260,9 +264,6 @@ def run_weekly_refresh():
             apex_logger.universe_token_added(token=_sym, market_cap_rank=0, daily_volume_usd=0)
     except Exception: pass
 
-    # Step 7 — Log final state
-    after = get_universe_snapshot(conn)
-    active_count = sum(1 for v in after.values() if v["active"])
     logger.info(f"Weekly refresh complete — {active_count} active tokens in universe")
     logger.info("=" * 60)
 

@@ -30,7 +30,7 @@ from typing import Optional
 
 from bot.config import (
     PAPER_TRADING, INITIAL_CAPITAL, DB,
-    TRAILING_SL, TP, ENTRY, TIME_STOP_CANDLES,
+    TRAILING_SL, TP, ENTRY,
     FILTERS, LOGS,
 )
 from bot.data_feed import get_exchange

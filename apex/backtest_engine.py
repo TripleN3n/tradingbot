@@ -347,8 +347,8 @@ def simulate(sigs, idx, direction, entry, sl, tp_unused, sl_dist, tf):
 # =============================================================================
 
 def _get_cooldown(tf):
-    cd_cfg = FILTERS["cooldown"]["candles_after_sl"]
-    return cd_cfg.get(tf, 4) if isinstance(cd_cfg, dict) else cd_cfg
+    from bot.config import COOLDOWN_CANDLES
+    return COOLDOWN_CANDLES.get("stop_loss", 4)
 
 
 def backtest_mtf(sigs, indicators, min_conf, rrr, mtf_arr, tf="1h"):

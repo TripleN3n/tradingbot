@@ -1,23 +1,42 @@
 # =============================================================================
 # APEX — Adaptive Per-token Execution Strategy Engine
 # apex/strategy_assigner.py — Strategy Assignment
-# Version 3.2 — Preserve existing assignments when no new strategy found
+# Version 3.8 — strategy_name, indicator_combo, daily_volume_usd fixes
 # =============================================================================
-# CHANGES FROM v3.1:
+# CHANGES FROM v3.2:
 #
-# _mark_token_unassigned():
-#   Previously called UPDATE SET is_active=0 unconditionally when no valid
-#   strategy was found, wiping any existing valid assignment.
-#   FIX: Now checks if an active assignment already exists. If it does,
-#   the existing assignment is preserved and only a warning is logged.
-#   Only tokens with NO existing assignment are marked inactive.
-#   This prevents the monthly rebalance from destroying 40 working
-#   assignments just because the current market conditions produce fewer
-#   valid backtest results.
+# _get_strategy_name():
+#   New helper. Maps backtest strategy_type to one of the 5 APEX strategy
+#   names used in the dashboard and reference doc:
+#     mtf_trend / mtf_trend_4h → Momentum Flow
+#     single_tf                → Trend Breakout
+#     mean_reversion           → Volatility Surge
+#     breakout                 → Alpha Confluence
+#     other                    → Momentum Squeeze
+#
+# _get_indicator_combo():
+#   New helper. Produces a short readable string of confirmation indicators
+#   (excluding mandatory ema/macro_ref) e.g. "macd+rsi+volume".
+#   Stored in indicator_combo column for dashboard display.
+#
+# init_strategy_db():
+#   Added strategy_name TEXT and indicator_combo TEXT to CREATE TABLE.
+#   Added safe ALTER TABLE migrations for both columns so existing DBs
+#   (APEX) upgrade automatically without data loss.
 #
 # assign_strategy_for_token():
-#   Now logs clearly whether it preserved an existing assignment or left
-#   a token with no assignment at all.
+#   INSERT now populates strategy_name and indicator_combo.
+#   ON CONFLICT UPDATE also keeps them in sync on rebalance.
+#
+# get_all_active_strategies():
+#   LEFT JOIN with universe table to fetch daily_volume_usd per token.
+#   Previously this was missing — the liquidity filter in signal_engine.py
+#   always received 999,999,999 and never actually filtered by volume.
+#   Also returns strategy_name in each strategy dict.
+#
+# Version 3.2 changes retained:
+#   _preserve_or_deactivate() — existing assignments kept when no new
+#   strategy found, preventing rebalance from wiping working assignments.
 # =============================================================================
 
 import sqlite3
@@ -31,11 +50,36 @@ from typing import Optional
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from bot.config import DB, LOGS, TIERS, TIMEFRAMES
 
+logger = logging.getLogger(__name__)
+
+
 # =============================================================================
-# LOGGING
+# STRATEGY NAME MAPPING
+# Maps backtest engine strategy_type to one of the 5 APEX strategy names.
 # =============================================================================
 
-logger = logging.getLogger(__name__)
+_STRATEGY_TYPE_TO_NAME = {
+    "mtf_trend":      "Momentum Flow",
+    "mtf_trend_4h":   "Momentum Flow",
+    "single_tf":      "Trend Breakout",
+    "mean_reversion": "Volatility Surge",
+    "breakout":       "Alpha Confluence",
+}
+
+
+def _get_strategy_name(strategy_type: str) -> str:
+    """Map backtest strategy_type to APEX strategy name."""
+    return _STRATEGY_TYPE_TO_NAME.get(strategy_type, "Momentum Squeeze")
+
+
+def _get_indicator_combo(indicators: list) -> str:
+    """
+    Build short readable indicator combo string for dashboard display.
+    Excludes mandatory ema/macro_ref — shows only confirmation indicators.
+    e.g. ["ema", "macro_ref", "rsi", "macd"] → "macd+rsi"
+    """
+    confirmation = [i for i in indicators if i not in ("ema", "macro_ref")]
+    return "+".join(sorted(confirmation)) if confirmation else "ema_only"
 
 
 # =============================================================================
@@ -46,6 +90,7 @@ def init_strategy_db(conn: sqlite3.Connection):
     """
     Create strategy assignment tables if they don't exist.
     Safe to call multiple times.
+    Runs safe ALTER TABLE migrations for new columns on existing DBs.
     """
     c = conn.cursor()
 
@@ -68,7 +113,9 @@ def init_strategy_db(conn: sqlite3.Connection):
             overfitting_gap     REAL NOT NULL,
             assigned_at         TEXT NOT NULL,
             source              TEXT NOT NULL,
-            is_active           INTEGER DEFAULT 1
+            is_active           INTEGER DEFAULT 1,
+            strategy_name       TEXT,
+            indicator_combo     TEXT
         )
     """)
 
@@ -108,6 +155,21 @@ def init_strategy_db(conn: sqlite3.Connection):
     """)
 
     conn.commit()
+
+    # Safe migrations — add new columns to existing DBs without data loss
+    for col, definition in [
+        ("strategy_name",   "TEXT"),
+        ("indicator_combo", "TEXT"),
+    ]:
+        try:
+            c.execute(
+                f"ALTER TABLE strategy_assignments ADD COLUMN {col} {definition}"
+            )
+            conn.commit()
+            logger.info(f"strategy_assignments: added {col} column (migration)")
+        except Exception:
+            pass  # Column already exists
+
     logger.info("Strategy database tables initialized")
 
 
@@ -126,27 +188,23 @@ def assign_strategy_for_token(
     Atomically replaces any existing assignment.
     Archives old strategy to history table before replacing.
 
-    FIX: When no valid strategy is found, the existing assignment is
-    preserved instead of being deactivated. This prevents monthly
-    rebalances from wiping working assignments when market conditions
-    produce fewer valid backtest results than usual.
+    FIX v3.8: Now populates strategy_name and indicator_combo columns.
 
-    Args:
-        conn:           Database connection
-        symbol:         Token symbol (e.g. BTC/USDT:USDT)
-        scored_results: Ranked list from strategy_scorer.score_strategies()
-        source:         What triggered this assignment
+    FIX v3.2: When no valid strategy found, existing assignment is
+    preserved instead of being deactivated.
 
-    Returns True if a new assignment was made, False if no valid strategy found.
+    Returns True if a new assignment was made, False if none found.
     """
     if not scored_results:
         logger.warning(f"No valid strategy to assign for {symbol}")
         _preserve_or_deactivate(conn, symbol)
         return False
 
-    best = scored_results[0]
-    vm   = best["val_metrics"]
-    now  = datetime.now(timezone.utc).isoformat()
+    best            = scored_results[0]
+    vm              = best["val_metrics"]
+    now             = datetime.now(timezone.utc).isoformat()
+    strategy_name   = _get_strategy_name(best.get("strategy_type", ""))
+    indicator_combo = _get_indicator_combo(best.get("indicators", []))
 
     c = conn.cursor()
 
@@ -160,8 +218,9 @@ def assign_strategy_for_token(
             tier_rrr, composite_score, win_rate, expectancy,
             profit_factor, max_drawdown, sharpe_ratio,
             train_trades, val_trades, overfitting_gap,
-            assigned_at, source, is_active
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            assigned_at, source, is_active,
+            strategy_name, indicator_combo
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
         ON CONFLICT(symbol) DO UPDATE SET
             timeframe       = excluded.timeframe,
             tier            = excluded.tier,
@@ -179,7 +238,9 @@ def assign_strategy_for_token(
             overfitting_gap = excluded.overfitting_gap,
             assigned_at     = excluded.assigned_at,
             source          = excluded.source,
-            is_active       = 1
+            is_active       = 1,
+            strategy_name   = excluded.strategy_name,
+            indicator_combo = excluded.indicator_combo
     """, (
         symbol,
         best["timeframe"],
@@ -198,6 +259,8 @@ def assign_strategy_for_token(
         best["overfitting_gap"],
         now,
         source,
+        strategy_name,
+        indicator_combo,
     ))
 
     _update_token_status(conn, symbol, tradeable=True, paused=False)
@@ -207,7 +270,7 @@ def assign_strategy_for_token(
         from bot.config import apex_logger
         apex_logger.strategy_assigned(
             token             = symbol,
-            strategy          = best.get("strategy_type", best.get("timeframe", "unknown")),
+            strategy          = strategy_name,
             timeframe         = best["timeframe"],
             tier              = best.get("assigned_tier", best.get("tier", "unknown")),
             metrics           = vm,
@@ -219,6 +282,7 @@ def assign_strategy_for_token(
     logger.info(
         f"Strategy assigned: {symbol.replace('/USDT:USDT', '')} | "
         f"{best['timeframe']} | {best['assigned_tier']} | "
+        f"{strategy_name} ({indicator_combo}) | "
         f"Score: {best['composite_score']:.4f} | "
         f"WR: {vm['win_rate']:.1%} | "
         f"Exp: {vm['expectancy']:.4f} | "
@@ -236,9 +300,9 @@ def assign_strategies_for_all_tokens(
     """
     Assign strategies for all tokens in one pass.
 
-    Returns dict with assignment summary:
-        assigned:  list of symbols with a new strategy assigned
-        preserved: list of symbols where existing strategy was kept
+    Returns dict:
+        assigned:   list of symbols with a new strategy assigned
+        preserved:  list of symbols where existing strategy was kept
         unassigned: list of symbols with no strategy at all
     """
     assigned   = []
@@ -252,7 +316,6 @@ def assign_strategies_for_all_tokens(
         if success:
             assigned.append(symbol)
         else:
-            # Check if an existing assignment was preserved
             c = conn.cursor()
             c.execute(
                 "SELECT 1 FROM strategy_assignments WHERE symbol=? AND is_active=1",
@@ -265,20 +328,20 @@ def assign_strategies_for_all_tokens(
 
     logger.info(
         f"Assignment complete — "
-        f"{len(assigned)} new assignments | "
-        f"{len(preserved)} existing preserved | "
-        f"{len(unassigned)} with no strategy"
+        f"{len(assigned)} new | "
+        f"{len(preserved)} preserved | "
+        f"{len(unassigned)} no strategy"
     )
 
     if unassigned:
         logger.warning(
-            f"Tokens with no strategy at all: "
+            f"Tokens with no strategy: "
             f"{[s.replace('/USDT:USDT', '') for s in unassigned]}"
         )
 
     if preserved:
         logger.info(
-            f"Tokens keeping existing strategy (no better found): "
+            f"Tokens keeping existing strategy: "
             f"{[s.replace('/USDT:USDT', '') for s in preserved]}"
         )
 
@@ -295,9 +358,8 @@ def assign_strategies_for_all_tokens(
 
 def _archive_existing_assignment(conn: sqlite3.Connection, symbol: str, replaced_at: str):
     """
-    Move current assignment to history table before overwriting.
-    Preserves full audit trail of all strategy changes.
-    Only archives if a current assignment exists.
+    Move current assignment to history before overwriting.
+    Only archives if an active assignment exists.
     """
     c = conn.cursor()
     c.execute("""
@@ -326,37 +388,26 @@ def _archive_existing_assignment(conn: sqlite3.Connection, symbol: str, replaced
 
 def _preserve_or_deactivate(conn: sqlite3.Connection, symbol: str):
     """
-    FIX: Called when no valid strategy is found for a token.
+    Called when no valid strategy is found for a token.
 
-    Previous behaviour: always set is_active=0, wiping the existing
-    assignment and leaving the token with nothing.
-
-    New behaviour:
-    - If an active assignment already exists → preserve it, log a warning.
-      The token keeps trading on its existing validated strategy.
-    - If no active assignment exists → mark it inactive (nothing to preserve).
-
-    This ensures the monthly rebalance never reduces the active token count
-    below what it was before the rebalance ran.
+    If active assignment exists → preserve it (don't downgrade working tokens).
+    If no active assignment → mark inactive.
     """
     c = conn.cursor()
     c.execute(
-        "SELECT symbol, timeframe, tier, composite_score FROM strategy_assignments "
-        "WHERE symbol = ? AND is_active = 1",
+        "SELECT symbol, timeframe, tier, composite_score "
+        "FROM strategy_assignments WHERE symbol = ? AND is_active = 1",
         (symbol,)
     )
     existing = c.fetchone()
 
     if existing:
-        # Existing valid assignment found — preserve it
         logger.info(
             f"No new strategy for {symbol.replace('/USDT:USDT', '')} — "
             f"keeping existing: {existing[1]} | {existing[2]} | "
             f"score={existing[3]:.4f}"
         )
-        # Do NOT touch is_active — leave it as 1
     else:
-        # No existing assignment — mark as inactive
         c.execute(
             "UPDATE strategy_assignments SET is_active = 0 WHERE symbol = ?",
             (symbol,)
@@ -368,9 +419,7 @@ def _preserve_or_deactivate(conn: sqlite3.Connection, symbol: str):
 
 
 def _mark_token_unassigned(conn: sqlite3.Connection, symbol: str):
-    """
-    Kept for backward compatibility. Now delegates to _preserve_or_deactivate.
-    """
+    """Backward compatibility — delegates to _preserve_or_deactivate."""
     _preserve_or_deactivate(conn, symbol)
 
 
@@ -431,6 +480,7 @@ def get_strategy(conn: sqlite3.Connection, symbol: str) -> Optional[dict]:
             sa.min_confluence, sa.tier_rrr, sa.composite_score,
             sa.win_rate, sa.expectancy, sa.profit_factor,
             sa.max_drawdown, sa.sharpe_ratio, sa.assigned_at,
+            sa.strategy_name, sa.indicator_combo,
             ts.is_tradeable, ts.is_paused, ts.pause_reason
         FROM strategy_assignments sa
         LEFT JOIN token_status ts ON sa.symbol = ts.symbol
@@ -455,9 +505,11 @@ def get_strategy(conn: sqlite3.Connection, symbol: str) -> Optional[dict]:
         "max_drawdown":    row[10],
         "sharpe_ratio":    row[11],
         "assigned_at":     row[12],
-        "is_tradeable":    bool(row[13]) if row[13] is not None else False,
-        "is_paused":       bool(row[14]) if row[14] is not None else False,
-        "pause_reason":    row[15],
+        "strategy_name":   row[13],
+        "indicator_combo": row[14],
+        "is_tradeable":    bool(row[15]) if row[15] is not None else False,
+        "is_paused":       bool(row[16]) if row[16] is not None else False,
+        "pause_reason":    row[17],
     }
 
 
@@ -465,6 +517,12 @@ def get_all_active_strategies(conn: sqlite3.Connection) -> list:
     """
     Get all currently active strategy assignments.
     Bot uses this to know which tokens to scan each cycle.
+
+    FIX v3.8: LEFT JOIN with universe table to fetch daily_volume_usd.
+    Previously the liquidity filter in signal_engine.py always received
+    999_999_999 because this field was never populated — every token
+    bypassed the volume check silently.
+    Also returns strategy_name for logging and dashboard.
     """
     c = conn.cursor()
     c.execute("""
@@ -472,9 +530,12 @@ def get_all_active_strategies(conn: sqlite3.Connection) -> list:
             sa.symbol, sa.timeframe, sa.tier, sa.indicators,
             sa.min_confluence, sa.tier_rrr, sa.composite_score,
             sa.win_rate, sa.expectancy,
-            ts.is_tradeable, ts.is_paused
+            sa.strategy_name, sa.indicator_combo,
+            ts.is_tradeable, ts.is_paused,
+            COALESCE(u.daily_volume_usd, 999999999) as daily_volume_usd
         FROM strategy_assignments sa
         LEFT JOIN token_status ts ON sa.symbol = ts.symbol
+        LEFT JOIN universe u ON sa.symbol = u.symbol
         WHERE sa.is_active = 1
         AND (ts.is_paused = 0 OR ts.is_paused IS NULL OR ts.symbol IS NULL)
         ORDER BY sa.composite_score DESC
@@ -485,17 +546,20 @@ def get_all_active_strategies(conn: sqlite3.Connection) -> list:
 
     for row in rows:
         strategies.append({
-            "symbol":          row[0],
-            "timeframe":       row[1],
-            "tier":            row[2],
-            "indicators":      json.loads(row[3]),
-            "min_confluence":  row[4],
-            "tier_rrr":        row[5],
-            "composite_score": row[6],
-            "win_rate":        row[7],
-            "expectancy":      row[8],
-            "is_tradeable":    bool(row[9]) if row[9] is not None else False,
-            "is_paused":       bool(row[10]) if row[10] is not None else False,
+            "symbol":           row[0],
+            "timeframe":        row[1],
+            "tier":             row[2],
+            "indicators":       json.loads(row[3]),
+            "min_confluence":   row[4],
+            "tier_rrr":         row[5],
+            "composite_score":  row[6],
+            "win_rate":         row[7],
+            "expectancy":       row[8],
+            "strategy_name":    row[9] or "Unknown",
+            "indicator_combo":  row[10] or "",
+            "is_tradeable":     bool(row[11]) if row[11] is not None else False,
+            "is_paused":        bool(row[12]) if row[12] is not None else False,
+            "daily_volume_usd": row[13],
         })
 
     return strategies
@@ -517,15 +581,13 @@ def get_assignment_summary(conn: sqlite3.Connection) -> dict:
 
     c.execute("""
         SELECT tier, COUNT(*) FROM strategy_assignments
-        WHERE is_active = 1
-        GROUP BY tier
+        WHERE is_active = 1 GROUP BY tier
     """)
     tier_counts = dict(c.fetchall())
 
     c.execute("""
         SELECT timeframe, COUNT(*) FROM strategy_assignments
-        WHERE is_active = 1
-        GROUP BY timeframe
+        WHERE is_active = 1 GROUP BY timeframe
     """)
     tf_counts = dict(c.fetchall())
 
@@ -580,7 +642,10 @@ if __name__ == "__main__":
 
         if success:
             strategy = get_strategy(conn, sym)
-            print(f"Assigned: {strategy['timeframe']} | {strategy['tier']} | Score: {strategy['composite_score']:.4f}")
+            print(
+                f"Assigned: {strategy['timeframe']} | {strategy['tier']} | "
+                f"{strategy['strategy_name']} | Score: {strategy['composite_score']:.4f}"
+            )
         else:
             print(f"No new strategy — existing preserved if available")
 
