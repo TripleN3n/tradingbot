@@ -673,10 +673,19 @@ with st.container(border=True):
                     entry_dt = dt.strftime("%d %b %H:%M")
                 else: entry_dt = "—"
             except: entry_dt = "—"
-            from bot.config import TIME_STOP_CANDLES
-            time_limit = TIME_STOP_CANDLES.get(tf.lower(), 24)
-            bars_left  = max(0, time_limit - bars)
-            bl_color   = "var(--red)" if bars_left <= 3 else "var(--gold)" if bars_left <= 8 else "var(--dim)"
+            from bot.trade_manager import TIME_STOP_HOURS
+            from datetime import datetime as _dt, timezone as _tz
+            _tf_candle_h = {"1h": 1, "4h": 4, "1d": 24}
+            _entry_str   = row.get("entry_time", "")
+            try:
+                _entry_dt  = _dt.fromisoformat(_entry_str)
+                _elapsed_h = (_dt.now(_tz.utc) - _entry_dt).total_seconds() / 3600
+            except Exception:
+                _elapsed_h = 0
+            _limit_h   = TIME_STOP_HOURS.get(tf.lower(), 30)
+            _ch        = _tf_candle_h.get(tf.lower(), 1)
+            bars_left  = max(0, int((_limit_h - _elapsed_h) / _ch))
+            bl_color   = "var(--red)" if bars_left <= 1 else "var(--gold)" if bars_left <= 3 else "var(--dim)"
             rows += f"""<div class="op-row">
                 <span style="color:var(--text);font-weight:700">{sym}</span>
                 <span><span class="{dc}" style="padding:0.1rem 0.4rem;border-radius:3px;font-size:0.58rem">{d.title()}</span></span>

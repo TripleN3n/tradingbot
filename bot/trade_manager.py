@@ -116,6 +116,12 @@ def init_trades_db(conn: sqlite3.Connection):
     except Exception:
         pass
 
+    try:
+        c.execute("ALTER TABLE trades ADD COLUMN last_candle_ts TEXT DEFAULT NULL")
+        conn.commit()
+        logger.info("Trades DB: added last_candle_ts column (schema migration)")
+    except Exception:
+        pass
     logger.info("Trades database initialized")
 
 
@@ -721,11 +727,18 @@ def monitor_open_trades(
             check_primary_tp(conn, trade, current_high, current_low)
             trade = get_trade(conn, trade["id"])
 
-            conn.cursor().execute(
-                "UPDATE trades SET candles_open = candles_open + 1 WHERE id = ?",
-                (trade["id"],)
-            )
-            conn.commit()
+            _tf_hours     = {"1h": 1, "4h": 4, "1d": 24}
+            _ch           = _tf_hours.get(timeframe, 1)
+            _now          = datetime.now(timezone.utc)
+            _floor_h      = (_now.hour // _ch) * _ch
+            _candle_floor = _now.replace(hour=_floor_h, minute=0, second=0, microsecond=0).isoformat()
+            _last_ts      = trade.get("last_candle_ts") or ""
+            if _candle_floor != _last_ts:
+                conn.cursor().execute(
+                    "UPDATE trades SET candles_open = candles_open + 1, last_candle_ts = ? WHERE id = ?",
+                    (_candle_floor, trade["id"])
+                )
+                conn.commit()
             trade = get_trade(conn, trade["id"])
 
             sl_hit = (
