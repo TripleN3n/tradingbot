@@ -6,6 +6,7 @@
 
 import sqlite3
 import logging
+import signal     # FIX 2026-04-10 audit C-ε: graceful SIGTERM handling
 import time
 import sys
 import traceback
@@ -14,7 +15,6 @@ from pathlib import Path
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from bot.config import PAPER_TRADING, INITIAL_CAPITAL, LOGS, DB, apex_logger, get_config_dict
 from bot.data_feed import fetch_cycle_data
@@ -396,8 +396,18 @@ def startup():
 # SCHEDULER
 # =============================================================================
 
+def _sigterm_handler(signum, frame):
+    """FIX 2026-04-10 audit C-ε: Convert SIGTERM into SystemExit so the existing
+    KeyboardInterrupt/SystemExit except in start() runs scheduler.shutdown() and _cleanup().
+    Without this, systemctl stop / kill would terminate the bot mid-cycle without closing
+    DB connections cleanly, risking write-cursor loss on trades.db."""
+    logger.info(f"Received signal {signum} — initiating graceful shutdown")
+    raise SystemExit(0)
+
+
 def start():
     """Start the trading bot. Runs one cycle immediately then every hour."""
+    signal.signal(signal.SIGTERM, _sigterm_handler)   # FIX C-ε
     startup()
 
     scheduler = BlockingScheduler(timezone="UTC")

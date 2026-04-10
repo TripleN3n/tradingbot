@@ -30,7 +30,6 @@ from pathlib import Path
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
 from bot.config import (
     REBALANCE, BACKTEST, DB, LOGS, TIMEFRAMES,
 )
@@ -444,6 +443,22 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.command == "setup":
+        # FIX 2026-04-10 audit C-γ: 'setup' wipes apex.db schema and all strategy assignments.
+        # Previously had ZERO confirmation prompt — running on a live server destroyed all
+        # strategies and triggered hours of re-backtesting. Now requires explicit confirmation.
+        import sys
+        print()
+        print("=" * 70)
+        print("WARNING: 'setup' will reinitialize apex.db schema.")
+        print("All current strategy_assignments will be LOST.")
+        print("The bot will have no strategies until backtests repopulate them")
+        print("(monthly rebalance can take several hours).")
+        print("=" * 70)
+        print()
+        confirm = input("Type 'WIPE APEX DB' (in capitals) to confirm, or anything else to abort: ")
+        if confirm != "WIPE APEX DB":
+            print("Aborted — confirmation phrase did not match.")
+            sys.exit(1)
         run_initial_setup()
 
     elif args.command == "rebalance":

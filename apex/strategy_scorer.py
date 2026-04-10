@@ -35,7 +35,6 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
 from bot.config import (
     SCORING_WEIGHTS, SCORING_MINIMUMS, TIERS,
     TIMEFRAME_TIEBREAKER_PCT, TIMEFRAME_PRIORITY, LOGS,

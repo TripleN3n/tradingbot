@@ -1,13 +1,56 @@
-*.log
-logs/
+# =============================================================================
+# .gitignore — APEX trading bot
+# Last updated: 2026-04-10 (audit Phase 2D — consolidated and expanded)
+# =============================================================================
+
+# Python bytecode
 __pycache__/
 *.pyc
-.env
-data/*.db
-backups/
-.sync_state.json
-backups/
-backtest_data.db
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local archives (preserved on disk for reference, not in repo)
+_archive/
+
+# Logs (rotated separately, never in repo)
+logs/
+*.log
+nohup.out
+
+# Databases (backed up out-of-band)
 data/
+data/*.db
+data/*.db-journal
+data/*.db-shm
+data/*.db-wal
 *.db
+*.db.bak
 *.bak
+
+# Sync state
+.sync_state.json
+
+# Legacy v1 datasets
+backtest_data.db
+
+# Backups created by audit phases / patches
+backups/
+*.preaudit_*
+
+# Secrets — NEVER commit these
+.env
+.env.*
+*.key
+*.pem
+ssh-key-*
+credentials.json
+secrets.json
+
+# OS noise
+.DS_Store
+Thumbs.db

@@ -379,7 +379,11 @@ def set_cooldown(cooldown_tracker: dict, symbol: str, exit_reason: str) -> dict:
         exit_reason:      'stop_loss', 'time_stop', or 'take_profit'
     """
     candles = COOLDOWN_CANDLES.get(exit_reason, COOLDOWN_CANDLES.get("stop_loss", 4))
-    cooldown_tracker[symbol] = candles
+    # FIX 2026-04-10 audit C-δ: +1 compensates for the same-cycle decrement that runs at the
+    # end of run_cycle() AFTER set_cooldown() was called from monitor_open_trades. Without
+    # the +1, a "4-candle cooldown" effectively blocked for only 3 cycles (off-by-one).
+    # This is a stopgap; the proper fix is timestamp-based cooldown (Phase 2D refactor).
+    cooldown_tracker[symbol] = candles + 1
     logger.debug(f"Cooldown set: {symbol} — {candles} candles ({exit_reason})")
     return cooldown_tracker
 

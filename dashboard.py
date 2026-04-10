@@ -10,7 +10,6 @@ from pathlib import Path
 import sys
 from streamlit_autorefresh import st_autorefresh
 
-sys.path.append(str(Path(__file__).resolve().parent))
 from bot.config import (INITIAL_CAPITAL, DB, PAPER_TRADING, DRAWDOWN)
 
 st.set_page_config(page_title="APEX", page_icon="▲",
@@ -332,7 +331,9 @@ tc = get_tc(); ac = get_ac()
 capital    = get_capital(tc)
 open_tr    = sq(tc,"SELECT * FROM trades WHERE status='open' ORDER BY entry_time DESC")
 closed_tr  = sq(tc,"SELECT * FROM trades WHERE status='closed' ORDER BY exit_time DESC")
-strategies = sq(ac,"""SELECT symbol,source as strategy,timeframe,tier,win_rate,
+# FIX 2026-04-10 audit C-α: was `source as strategy` which displayed assignment origin
+# ('rebalance'/'test'/'backtester') instead of strategy name. dashboard2.py was correct.
+strategies = sq(ac,"""SELECT symbol,COALESCE(strategy_name,source) as strategy,timeframe,tier,win_rate,
                        expectancy,profit_factor,val_trades,
                        COALESCE(indicator_combo,'') as indicator_combo
                        FROM strategy_assignments WHERE is_active=1 ORDER BY win_rate DESC""")
@@ -648,10 +649,15 @@ with st.container(border=True):
             lev      = float(row.get("leverage",1) or 1)
             bars     = int(row.get("candles_open",0) or 0)
             cur      = cur_prices.get(full_sym, e)
-            if d == "LONG": up = (cur - e) * qty * lev
-            else:           up = (e - cur) * qty * lev
+            # FIX 2026-04-10 audit C-η: qty already includes leverage (capital_manager.calculate_position_size
+            # bakes leverage into qty per gotcha #4). Multiplying by lev was double-counting and inflating
+            # the displayed dollar PnL by `lev` times. up_pct then divided by leveraged notional which
+            # cancelled the error by accident. Both fixed: qty-only PnL, margin-relative %.
+            if d == "LONG": up = (cur - e) * qty
+            else:           up = (e - cur) * qty
             total_unreal += up
-            up_pct = (up / (e * qty)) * 100 if e > 0 and qty > 0 else 0
+            margin = (e * qty / lev) if lev > 0 else (e * qty)
+            up_pct = (up / margin) * 100 if margin > 0 else 0
             uc = "val-green" if up >= 0 else "val-red"
             us = "+" if up >= 0 else ""
             rating_map = {"tier1":"A","tier2":"B","tier3":"C"}

@@ -47,7 +47,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
 from bot.config import DB, LOGS, TIERS, TIMEFRAMES
 
 logger = logging.getLogger(__name__)

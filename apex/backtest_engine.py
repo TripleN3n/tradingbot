@@ -33,7 +33,6 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
 from bot.config import (
     BACKTEST, SCORING_MINIMUMS, TIERS,
     EMA, RSI, MACD, BOLLINGER, VOLUME,
@@ -540,8 +539,14 @@ def calc_metrics(trades):
     exp = wr*aw + (1-wr)*al
     gp = wins.sum(); gl = abs(losses.sum())
     pf = gp/gl if gl > 0 else 0
-    cum = np.cumsum(pnls); pk = np.maximum.accumulate(cum)
-    mdd = float((pk-cum).max()) if len(cum) > 0 else 0
+    # FIX 2026-04-10 audit C-ζ: max_drawdown is now equity-curve peak-to-trough (compounded),
+    # NOT sum-of-pcts. Old code summed pnl_pct values which is wrong as returns compound.
+    # Result: mdd was rejecting healthy strategies and accepting unhealthy ones at the
+    # SCORING_MINIMUMS["max_drawdown"] gate. pnls is in decimal form (e.g. 0.05 = 5%) per
+    # simulate() return values, so equity multiplier is (1 + pnl).
+    eq  = np.cumprod(1 + pnls)
+    pk  = np.maximum.accumulate(eq)
+    mdd = float(((pk - eq) / pk).max()) if len(eq) > 0 else 0
     sh  = pnls.mean()/pnls.std()*np.sqrt(252) if pnls.std() > 0 else 0
     return {
         "win_rate": wr, "expectancy": exp, "profit_factor": pf,

@@ -1,11 +1,0 @@
---2026-03-29 21:19:48--  https://raw.githubusercontent.com/TripleN3n/tradingbot/main/dashboard.py
-Resolving raw.githubusercontent.com (raw.githubusercontent.com)... 185.199.108.133, 185.199.109.133, 185.199.110.133, ...
-Connecting to raw.githubusercontent.com (raw.githubusercontent.com)|185.199.108.133|:443... connected.
-HTTP request sent, awaiting response... 200 OK
-Length: 16100 (16K) [text/plain]
-Saving to: ‘dashboard.py’
-
-dashboard.py                                 0%[                                                                                         ]       0  --.-KB/s               dashboard.py                               100%[========================================================================================>]  15.72K  --.-KB/s    in 0s      
-
-2026-03-29 21:19:53 (93.4 MB/s) - ‘dashboard.py’ saved [16100/16100]
-

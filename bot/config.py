@@ -22,6 +22,16 @@
 import os
 from pathlib import Path
 
+# FIX 2026-04-10 audit Phase 2D: load .env on import so os.getenv() reads
+# Telegram/Binance credentials. Previously only the v1 root config.py called
+# load_dotenv() — and that file is now in _archive/v1_legacy/, so without
+# this line the canonical bot would silently see empty env vars.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv is optional; env vars can also come from systemd/shell
+
 # =============================================================================
 # 1. ENVIRONMENT
 # =============================================================================
@@ -171,7 +181,7 @@ BOLLINGER = {
 
 VOLUME = {
     "period":         20,
-    "min_multiplier": 1.1,
+    "min_multiplier": 1.2,    # FIX 2026-04-10 audit: Strategy ref §3 — was 1.1, doc requires ≥1.2× 20-period avg on entry candle
 }
 
 # =============================================================================
@@ -181,8 +191,8 @@ VOLUME = {
 SL = {
     "atr_period":     14,
     "atr_multiplier": 1.5,
-    "min_pct":        0.015,
-    "max_pct":        0.03,
+    "min_pct":        0.03,    # FIX 2026-04-10 audit: Strategy ref §12 — hard floor 3%, never tighter (was 0.015 — re-introduced the noise stop-out bug Lessons §18 was written to prevent)
+    "max_pct":        0.20,    # FIX 2026-04-10 audit: Was a strategy CAP capping wide SLs DOWN to 3% (inverted semantics); now a sanity ceiling only — catches obvious bugs >20% SL
 }
 
 TRAILING_SL = {
@@ -266,7 +276,7 @@ FILTERS = {
 
     "volume": {
         "enabled":         True,
-        "min_multiplier":  1.1,
+        "min_multiplier":  1.2,    # FIX 2026-04-10 audit: Strategy ref §3 — was 1.1 (must match VOLUME.min_multiplier above; both keys read by run_all_filters)
         "lookback_period": 20,
     },
 
@@ -331,7 +341,7 @@ PERFORMANCE_MONITOR = {
     "enabled":         True,
     "lookback_trades": 20,
     "min_expectancy":  0.0,
-    "min_win_rate":    0.40,
+    "min_win_rate":    0.35,    # FIX 2026-04-10 audit: Strategy ref §15 — was 0.40, doc says token paused if last-20 WR drops below 35%
 }
 
 # =============================================================================
@@ -360,11 +370,15 @@ SCORING_WEIGHTS = {
 }
 
 SCORING_MINIMUMS = {
-    "expectancy":    0.0,
-    "win_rate":      0.35,
-    "max_drawdown":  0.30,
-    "profit_factor": 1.05,
-    "sharpe_ratio":  0.25,
+    # FIX 2026-04-10 audit: Strategy ref §4 — meet-in-the-middle thresholds.
+    # Was: WR 0.35, DD 0.30, PF 1.05, Sharpe 0.25 (too lenient — let mediocre strategies through).
+    # Doc original: WR 0.45, DD 0.20, PF 1.5, Sharpe 1.0 (too strict — qualified almost zero strategies in Apr 6 rebalance).
+    # New: balanced thresholds. Phase 4 backtests will measure qualification yield + quality.
+    "expectancy":    0.0,     # Must be positive
+    "win_rate":      0.40,    # Was 0.35; doc 0.45
+    "max_drawdown":  0.25,    # Was 0.30; doc 0.20
+    "profit_factor": 1.25,    # Was 1.05; doc 1.5
+    "sharpe_ratio":  0.5,     # Was 0.25; doc 1.0
 }
 
 # =============================================================================

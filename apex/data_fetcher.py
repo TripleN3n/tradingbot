@@ -32,7 +32,6 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import sys
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
 from bot.config import (
     EXCHANGE, PAPER_TRADING, TIMEFRAMES, BACKTEST,
     EXCLUDED_TOKENS, FILTERS, DB, LOGS,

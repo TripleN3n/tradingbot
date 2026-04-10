@@ -28,7 +28,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
 from bot.config import REBALANCE, FILTERS, DB, LOGS, TIMEFRAMES, BACKTEST
 from apex.data_fetcher import (
     get_exchange,
