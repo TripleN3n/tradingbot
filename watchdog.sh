@@ -9,7 +9,7 @@ STREAMLIT="/home/opc/.local/bin/streamlit"
 timestamp() { date '+%Y-%m-%d %H:%M:%S'; }
 
 # Check bot
-if ! pgrep -f "bot.main" > /dev/null; then
+if ! pgrep -f "python3 -m bot.main" > /dev/null; then
     echo "[$(timestamp)] BOT DEAD — restarting..." >> $LOG
     cd $DIR
     nohup python3 -m bot.main > $DIR/logs/bot.log 2>&1 &
@@ -29,7 +29,7 @@ else
 fi
 
 # Check rebalancer
-if ! pgrep -f "apex.rebalancer" > /dev/null; then
+if ! pgrep -f "python3 -m apex.rebalancer" > /dev/null; then
     echo "[$(timestamp)] REBALANCER DEAD — restarting..." >> $LOG
     cd $DIR
     nohup python3 -m apex.rebalancer schedule > $DIR/logs/rebalancer.log 2>&1 &
