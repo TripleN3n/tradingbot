@@ -196,8 +196,7 @@ def calc_stats(closed):
     pnls = [pnl_of(t) for t in closed]
     if not pnls:
         return dict(total=0,wins=0,losses=0,neutral=0,wr=0.0,exp=0.0,
-                    pf=0.0,avg_win=0.0,avg_loss=0.0,best=0.0,worst=0.0,total_pnl=0.0,
-                    max_win_streak=0,max_loss_streak=0)
+                    pf=0.0,avg_win=0.0,avg_loss=0.0,best=0.0,worst=0.0,total_pnl=0.0)
     wins   = [p for p in pnls if p >  0.005]
     losses = [p for p in pnls if p < -0.005]
     neut   = len(pnls) - len(wins) - len(losses)
@@ -206,31 +205,13 @@ def calc_stats(closed):
     al     = sum(losses)/len(losses) if losses else 0.0
     gp     = sum(wins)
     gl     = abs(sum(losses))
-
-    # FIX 2026-04-11 (user feedback round 2): compute Max Win Streak and Max
-    # Loss Streak. closed comes from get_trades sorted by exit_time DESC, so we
-    # reverse to chronological order (oldest first). Neutral trades (|pnl|<0.005)
-    # are ignored — they neither extend nor break a streak.
-    closed_chrono = sorted(closed, key=lambda t: t.get('exit_time', '') or '')
-    max_w_streak = max_l_streak = cur_w = cur_l = 0
-    for t in closed_chrono:
-        p = pnl_of(t)
-        if p > 0.005:
-            cur_w += 1; cur_l = 0
-            if cur_w > max_w_streak: max_w_streak = cur_w
-        elif p < -0.005:
-            cur_l += 1; cur_w = 0
-            if cur_l > max_l_streak: max_l_streak = cur_l
-
     return dict(
         total=len(pnls), wins=len(wins), losses=len(losses), neutral=neut,
         wr=round(wr,1), exp=round((wr/100)*aw+(1-wr/100)*al,2),
         pf=round(gp/gl if gl else 0,2),
         avg_win=round(aw,2), avg_loss=round(al,2),
         best=round(max(pnls),2), worst=round(min(pnls),2),
-        total_pnl=round(sum(pnls),2),
-        max_win_streak=max_w_streak,
-        max_loss_streak=max_l_streak,
+        total_pnl=round(sum(pnls),2)
     )
 
 def get_today_pnl(closed):
@@ -474,10 +455,11 @@ body{background:var(--bg);color:var(--t1);font-family:var(--ui);font-size:14px;m
 .fg-greed{color:var(--green);}
 .updated{font-size:9px;color:var(--t3);}
 
-/* KPI rows — FIX 2026-04-11 user feedback round 2: 5 cards per row, 2 rows
-   = 10 cards total. Row 1 = current state, Row 2 = historical performance. */
-.kpi-row1{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:10px;}
-.kpi-row2{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px;}
+/* KPI rows — FIX 2026-04-11 user feedback round 3: 4 cards per row, 2 rows
+   = 8 cards total. Row 1 = current state, Row 2 = performance. Card width
+   gets ~25% more vs the previous 5-per-row. */
+.kpi-row1{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px;}
+.kpi-row2{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px;}
 .mc{background:var(--bg2);border:1px solid var(--bd);border-radius:10px;padding:14px 16px;position:relative;overflow:hidden;}
 .mc::after{content:'';position:absolute;top:0;left:0;right:0;height:2px;border-radius:10px 10px 0 0;}
 .mc-teal::after{background:var(--teal);}
@@ -564,8 +546,7 @@ td{padding:8px 12px 8px 0;border-top:1px solid var(--bd);color:var(--t2);white-s
 
 .footer{text-align:center;color:var(--t3);font-size:10px;padding:20px 0 8px;letter-spacing:.04em;}
 
-@media(max-width:1300px){.kpi-row1,.kpi-row2{grid-template-columns:repeat(3,1fr);}}
-@media(max-width:900px){.kpi-row1,.kpi-row2{grid-template-columns:repeat(2,1fr);}}
+@media(max-width:1100px){.kpi-row1,.kpi-row2{grid-template-columns:repeat(2,1fr);}}
 @media(max-width:768px){
   .kpi-row1,.kpi-row2{grid-template-columns:repeat(2,1fr);}
   .two-col{grid-template-columns:1fr;}
@@ -595,41 +576,41 @@ td{padding:8px 12px 8px 0;border-top:1px solid var(--bd);color:var(--t2);white-s
   </div>
 </div>
 
-<!-- KPI Row 1 — Current State -->
+<!-- KPI Row 1 — Current State (4 cards) -->
 <div class="kpi-row1">
   <div class="mc mc-teal">
     <div class="mc-lbl">Capital</div>
     <div class="mc-val" id="mCap">—</div>
     <div class="mc-sub" id="mCapSub">—</div>
   </div>
+  <div class="mc mc-amber">
+    <div class="mc-lbl">Tokens</div>
+    <div class="mc-val" id="mTokens">—</div>
+    <div class="mc-sub" id="mTokensSub">scanning</div>
+  </div>
   <div class="mc mc-blue">
     <div class="mc-lbl">Open Positions</div>
     <div class="mc-val" id="mOpen">—</div>
     <div class="mc-sub" id="mOpenSub">—</div>
   </div>
-  <div class="mc mc-amber">
-    <div class="mc-lbl">Strategies</div>
-    <div class="mc-val" id="mStrategies">—</div>
-    <div class="mc-sub" id="mStrategiesSub">active tokens</div>
-  </div>
   <div class="mc mc-purple">
-    <div class="mc-lbl">Today's P&amp;L</div>
-    <div class="mc-val" id="mTodayPnl">—</div>
-    <div class="mc-sub" id="mTodaySub">—</div>
-  </div>
-  <div class="mc mc-blue">
     <div class="mc-lbl">Unrealized P&amp;L</div>
     <div class="mc-val" id="mUnreal">—</div>
     <div class="mc-sub" id="mUnrealSub">—</div>
   </div>
 </div>
 
-<!-- KPI Row 2 — Historical Performance -->
+<!-- KPI Row 2 — Performance (4 cards) -->
 <div class="kpi-row2">
   <div class="mc mc-green">
     <div class="mc-lbl">Total P&amp;L</div>
     <div class="mc-val" id="mTotalPnl">—</div>
     <div class="mc-sub" id="mTotalSub">—</div>
+  </div>
+  <div class="mc mc-blue">
+    <div class="mc-lbl">Today's P&amp;L</div>
+    <div class="mc-val" id="mTodayPnl">—</div>
+    <div class="mc-sub" id="mTodaySub">—</div>
   </div>
   <div class="mc mc-amber">
     <div class="mc-lbl">Win Rate</div>
@@ -640,16 +621,6 @@ td{padding:8px 12px 8px 0;border-top:1px solid var(--bd);color:var(--t2);white-s
     <div class="mc-lbl">Drawdown</div>
     <div class="mc-val" id="mDD">—</div>
     <div class="mc-sub" id="mDDSub">—</div>
-  </div>
-  <div class="mc mc-teal">
-    <div class="mc-lbl">Max Win Streak</div>
-    <div class="mc-val" id="mWinStreak">—</div>
-    <div class="mc-sub" id="mWinStreakSub">consecutive wins</div>
-  </div>
-  <div class="mc mc-red">
-    <div class="mc-lbl">Max Loss Streak</div>
-    <div class="mc-val" id="mLossStreak">—</div>
-    <div class="mc-sub" id="mLossStreakSub">consecutive losses</div>
   </div>
 </div>
 
@@ -985,22 +956,17 @@ function render(d) {
   $('mOpen').textContent=d.open_count;
   $('mOpenSub').textContent=d.open_count?d.open_count+' active position'+(d.open_count>1?'s':''):'No open positions';
 
-  // FIX 2026-04-11 user feedback round 2: new Strategies card
-  $('mStrategies').textContent=d.active_tokens||0;
-  $('mStrategiesSub').textContent=(d.active_tokens||0)+' tokens scanning';
+  // FIX 2026-04-11 user feedback round 3: renamed Strategies -> Tokens.
+  // active_tokens is the count of tokens with assigned strategies (currently 62).
+  // There are only 5 STRATEGY TYPES total (Volatility Surge, Momentum Squeeze,
+  // Momentum Flow, Trend Breakout, Alpha Confluence) — each token gets one.
+  // NEVER call this "strategies" in user-facing labels.
+  $('mTokens').textContent=d.active_tokens||0;
+  $('mTokensSub').textContent='of top 100 scanning';
 
   $('mWR').textContent=d.stats.wr+'%';
   $('mWR').style.color=d.stats.wr>=50?'var(--teal)':'var(--amber)';
   $('mWRSub').textContent=d.stats.wins+'W  '+d.stats.losses+'L  '+d.stats.neutral+'N  of  '+d.stats.total;
-
-  // FIX 2026-04-11 user feedback round 2: Max Win/Loss Streak cards
-  const ws=d.stats.max_win_streak||0;
-  $('mWinStreak').textContent=ws;
-  $('mWinStreak').style.color=ws>=5?'var(--teal)':ws>=3?'var(--green)':'var(--t1)';
-
-  const ls=d.stats.max_loss_streak||0;
-  $('mLossStreak').textContent=ls;
-  $('mLossStreak').style.color=ls>=5?'var(--red)':ls>=3?'var(--amber)':'var(--t1)';
 
   $('mDD').textContent=d.drawdown+'%';
   $('mDD').style.color=d.drawdown>20?'var(--red)':d.drawdown>10?'var(--amber)':'var(--t1)';
