@@ -280,21 +280,22 @@ def build_breakdown(closed, strat_map):
 _TF_HOURS = {'1h': 1, '4h': 4, '1d': 24}
 
 def fmt_open(t, strat_map, prices=None):
-    """FIX 2026-04-11 audit Phase 4-bis dashboard agent — three changes:
-       1. 'stop' now reads trailing_sl (the live SL the engine actually checks)
-          with fallback to stop_loss. Was always showing the original entry stop,
-          which under pure_trailing_mode will diverge once price reaches +1R.
-       2. 'left' now uses TIME_STOP_HOURS + wall-clock elapsed instead of the
-          hardcoded `30 - bars` heuristic that was wrong on 1d timeframes.
-       3. 'current' uses live prices passed in via the `prices` arg, not the
-          stale ohlcv close from apex.db.
+    """FIX 2026-04-11 (user feedback round 2) — Open trades row with:
+       - bars: WALL-CLOCK elapsed candles (not DB candles_open which has stale
+         legacy values from pre-v3.8.1 cycle counter + spurious +1 per restart)
+       - left: same wall-clock math, total - elapsed
+       - entry/stop/current: rounded to 6 decimals (was raw float ~17 digits)
+       - rating: A/B/C from tier1/2/3 (matches dashboard.py convention)
+       - field order rearranged for logical reading sequence
+       - stop reads trailing_sl with stop_loss fallback (live, not frozen original)
+       - current uses live prices via fetch_current_prices (not stale ohlcv close)
     """
     sym   = t.get('symbol', '')
     entry = _f(t.get('avg_entry_price', t.get('entry_price', 0)))
-    bars  = int(_f(t.get('candles_open', 0)))
     dirn  = t.get('direction', '')
     qty   = _f(t.get('quantity_remaining', t.get('quantity', 0)))
     tf    = t.get('timeframe', '1h')
+    tier  = t.get('tier', 'tier2')
 
     # Live current price (with fallback to entry)
     curr = _f((prices or {}).get(sym), entry)
@@ -302,15 +303,22 @@ def fmt_open(t, strat_map, prices=None):
     # Unrealized P&L (qty already includes leverage — do NOT multiply by lev)
     pnl = ((curr - entry) * qty if dirn == 'long' else (entry - curr) * qty) if qty > 0 else 0.0
 
-    # Time-stop bars-left, computed from TIME_STOP_HOURS and entry wall-clock
+    # BARS + LEFT — both computed from wall-clock elapsed time. The DB's
+    # candles_open field is unreliable: it has legacy stale values (HBAR shows
+    # 62 because the pre-v3.8.1 cycle counter was incrementing every hour, not
+    # every candle close) AND a +1 spurious increment every time the bot
+    # restarts (because last_candle_ts="" on first observation triggers +1).
+    # Wall-clock elapsed is the source of truth.
     total_hours = TIME_STOP_HOURS.get(tf, 30)
     tf_h        = _TF_HOURS.get(tf, 1)
-    left = max(0, int(total_hours / tf_h) - bars)
+    bars = 0
+    left = max(0, int(total_hours / tf_h))
     entry_str = t.get('entry_time', '')
     if entry_str:
         try:
             entry_dt  = datetime.fromisoformat(str(entry_str).replace('Z', '+00:00'))
             elapsed_h = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 3600
+            bars = max(0, int(elapsed_h / tf_h))
             left = max(0, int((total_hours - elapsed_h) / tf_h))
         except Exception:
             pass
@@ -318,18 +326,24 @@ def fmt_open(t, strat_map, prices=None):
     # Live trailing stop (the SL the engine actually checks), fallback to original
     live_stop = _f(t.get('trailing_sl'), _f(t.get('stop_loss', 0)))
 
+    # Rating: A (tier1) / B (tier2) / C (tier3) — matches dashboard.py convention
+    rating_map = {'tier1': 'A', 'tier2': 'B', 'tier3': 'C'}
+    rating     = rating_map.get(tier, '?')
+
     return {
+        # Reordered for logical reading: identity → quality → direction → timing → prices → result → time-stop
         'coin':     _sym(sym),
+        'rating':   rating,
         'side':     dirn,
-        'strategy': strat_map.get(sym, ''),
         'tf':       tf,
-        'entry':    entry,
-        'stop':     live_stop,
-        'current':  round(curr, 4),
+        'strategy': strat_map.get(sym, ''),
+        'opened':   str(t.get('entry_time', ''))[:16],
+        'entry':    round(entry, 6),
+        'stop':     round(live_stop, 6),
+        'current':  round(curr, 6),
         'pnl':      round(pnl, 2),
         'bars':     bars,
         'left':     left,
-        'opened':   str(t.get('entry_time', ''))[:16]
     }
 
 def fmt_closed(t, strat_map):
@@ -483,6 +497,17 @@ td{padding:8px 12px 8px 0;border-top:1px solid var(--bd);color:var(--t2);white-s
 .zv{font-family:var(--mono);color:var(--t3);}
 .empty-row td{text-align:center;color:var(--t3);padding:22px;font-size:12px;border-top:none;}
 
+/* Rating pill (A/B/C from tier1/2/3) — added 2026-04-11 user feedback */
+.rating{font-size:10px;padding:2px 8px;border-radius:4px;font-weight:700;letter-spacing:.04em;display:inline-block;font-family:var(--mono);}
+.r-A{background:#00d4aa15;color:var(--teal);border:1px solid #00d4aa30;}
+.r-B{background:#60a5fa15;color:var(--blue);border:1px solid #60a5fa30;}
+.r-C{background:#f0b42915;color:var(--amber);border:1px solid #f0b42930;}
+
+/* Open Positions footer (unrealized P&L summary) — added 2026-04-11 user feedback */
+.open-footer{display:flex;justify-content:flex-end;align-items:center;gap:12px;padding:12px 0 2px;border-top:1px solid var(--bd);margin-top:8px;}
+.of-lbl{font-size:10px;color:var(--t3);letter-spacing:.08em;text-transform:uppercase;}
+.of-val{font-family:var(--mono);font-size:15px;font-weight:700;}
+
 /* Two col */
 .two-col{display:grid;grid-template-columns:3fr 2fr;gap:12px;margin-bottom:12px;}
 
@@ -612,13 +637,32 @@ td{padding:8px 12px 8px 0;border-top:1px solid var(--bd);color:var(--t2);white-s
   </div>
   <div class="tbl-scroll">
     <table>
+      <colgroup>
+        <col style="width:8%">  <!-- Coin -->
+        <col style="width:6%">  <!-- Rating -->
+        <col style="width:7%">  <!-- Side -->
+        <col style="width:5%">  <!-- TF -->
+        <col style="width:14%"> <!-- Strategy -->
+        <col style="width:11%"> <!-- Opened -->
+        <col style="width:10%"> <!-- Entry -->
+        <col style="width:10%"> <!-- Stop -->
+        <col style="width:10%"> <!-- Current -->
+        <col style="width:8%">  <!-- P&L -->
+        <col style="width:5%">  <!-- Bars -->
+        <col style="width:6%">  <!-- Left -->
+      </colgroup>
       <thead><tr>
-        <th>Coin</th><th>Side</th><th>Strategy</th><th>TF</th>
-        <th>Opened</th><th>Entry</th><th>Stop</th><th>Current</th>
+        <th>Coin</th><th>Rating</th><th>Side</th><th>TF</th>
+        <th>Strategy</th><th>Opened</th>
+        <th>Entry</th><th>Stop</th><th>Current</th>
         <th>P&amp;L</th><th>Bars</th><th>Left</th>
       </tr></thead>
-      <tbody id="openBody"><tr class="empty-row"><td colspan="11">No open positions</td></tr></tbody>
+      <tbody id="openBody"><tr class="empty-row"><td colspan="12">No open positions</td></tr></tbody>
     </table>
+  </div>
+  <div class="open-footer">
+    <span class="of-lbl">Unrealized P&amp;L</span>
+    <span class="of-val" id="openUnreal">$0.00</span>
   </div>
 </div>
 
@@ -770,12 +814,22 @@ function renderEquity(pts) {
 function renderOpen(trades) {
   $('openMeta').textContent = trades.length+' active';
   const el = $('openBody');
-  if (!trades.length){el.innerHTML='<tr class="empty-row"><td colspan="11">No open positions</td></tr>';return;}
+  const footEl = $('openUnreal');
+  if (!trades.length){
+    el.innerHTML='<tr class="empty-row"><td colspan="12">No open positions</td></tr>';
+    if(footEl){footEl.textContent='$0.00'; footEl.style.color='var(--t3)';}
+    return;
+  }
+  // Aggregate unrealized for footer (sum of per-row pnl values)
+  let totalUnreal = 0;
+  trades.forEach(t => { totalUnreal += parseFloat(t.pnl) || 0; });
+
   el.innerHTML = trades.map(t=>`<tr>
     <td class="tc">${t.coin}</td>
+    <td><span class="rating r-${t.rating}">${t.rating}</span></td>
     <td><span class="badge b-${t.side}">${t.side.toUpperCase()}</span></td>
-    <td style="color:var(--t2);font-size:11px">${t.strategy||'—'}</td>
     <td style="color:var(--t3)">${t.tf}</td>
+    <td style="color:var(--t2);font-size:11px">${t.strategy||'—'}</td>
     <td style="color:var(--t3);font-size:11px">${t.opened}</td>
     <td class="mv">${t.entry}</td>
     <td class="nv">${t.stop}</td>
@@ -784,6 +838,12 @@ function renderOpen(trades) {
     <td style="color:var(--t3)">${t.bars}</td>
     <td style="color:${t.left<=3?'var(--amber)':'var(--t3)'}">${t.left}</td>
   </tr>`).join('');
+
+  // Render footer unrealized P&L
+  if (footEl) {
+    footEl.textContent = (totalUnreal>=0?'+$':'-$') + Math.abs(totalUnreal).toFixed(2);
+    footEl.style.color = totalUnreal>0?'var(--green)':totalUnreal<0?'var(--red)':'var(--t3)';
+  }
 }
 
 function renderClosed(trades) {
