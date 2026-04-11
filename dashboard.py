@@ -387,8 +387,14 @@ if not open_tr.empty:
             qty       = float(row.get("quantity_remaining", row.get("quantity", 0)) or 0)
             leverage  = float(row.get("leverage", 1) or 1)
             cur_price = cur_prices_cached.get(sym, entry)
-            if direction == "long": unreal_pnl += (cur_price - entry) * qty * leverage
-            else:                   unreal_pnl += (entry - cur_price) * qty * leverage
+            # FIX 2026-04-11 audit Phase 4-bis bonus (C-η completion):
+            # qty already includes leverage per capital_manager.calculate_position_size
+            # (line 400-401: quantity = position_usdt * leverage / entry). Multiplying by
+            # leverage here was double-counting. The fix was applied to the per-row
+            # render block at line 657 in Phase 2C but I missed this earlier aggregation
+            # site. Caught by the dashboard investigator agent 2026-04-11.
+            if direction == "long": unreal_pnl += (cur_price - entry) * qty
+            else:                   unreal_pnl += (entry - cur_price) * qty
     except: unreal_pnl = 0.0
 
 def get_live_price(symbol: str):

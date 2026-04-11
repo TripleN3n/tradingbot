@@ -4,11 +4,19 @@ APEX Dashboard v2 — Premium Trading Dashboard
 Flask + Vanilla JS | Port 8502
 """
 
-import sqlite3, json, os, re, glob, logging
+import sqlite3, json, os, re, glob, logging, time, sys
 from flask import Flask, jsonify, Response
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
+
+# FIX 2026-04-11 audit Phase 4-bis dashboards: import bot.* modules so we can use
+# the canonical TIME_STOP_HOURS, fetch_current_prices, etc. instead of hardcoding.
+sys.path.insert(0, '/home/opc/tradingbot')
+try:
+    from bot.trade_manager import TIME_STOP_HOURS
+except Exception:
+    TIME_STOP_HOURS = {"1h": 30, "4h": 120, "1d": 240}  # safe fallback
 
 logging.basicConfig(level=logging.WARNING)
 app = Flask(__name__)
@@ -18,6 +26,11 @@ TRADES_DB  = BASE / 'data' / 'trades.db'
 APEX_DBS   = [BASE / 'data' / 'apex.db', BASE / 'apex.db']
 BOT_LOG    = BASE / 'logs' / 'bot.log'
 FILTER_DIR = BASE / 'logs' / 'apex_events' / 'filters'
+
+# FIX 2026-04-11: live-price cache (60s TTL) — replaces stale ohlcv close reads.
+# Module-level since Flask doesn't have session_state.
+_PRICE_CACHE = {"prices": {}, "ts": 0.0}
+_PRICE_TTL_SEC = 60
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 def _conn(path):
@@ -106,10 +119,50 @@ def get_filter_rejects():
     return [{'name':k,'count':v,'tokens':len(tok_set[k])}
             for k,v in sorted(counts.items(), key=lambda x:-x[1])]
 
+# ── Live price helper (FIX 2026-04-11: replaces stale ohlcv close reads) ──
+def get_live_prices(symbols):
+    """Cached live-price fetch from bot.data_feed.fetch_current_prices.
+    Refreshes every _PRICE_TTL_SEC seconds. Returns {symbol: price} dict.
+    Falls back to last cached values on fetch error."""
+    if not symbols:
+        return {}
+    now = time.time()
+    if (now - _PRICE_CACHE["ts"]) < _PRICE_TTL_SEC and _PRICE_CACHE["prices"]:
+        return _PRICE_CACHE["prices"]
+    try:
+        from bot.data_feed import fetch_current_prices
+        fresh = fetch_current_prices(list(symbols))
+        if isinstance(fresh, dict) and fresh:
+            _PRICE_CACHE["prices"] = fresh
+            _PRICE_CACHE["ts"]     = now
+        return _PRICE_CACHE["prices"]
+    except Exception:
+        return _PRICE_CACHE["prices"] or {}
+
+# ── Portfolio capital helper (FIX 2026-04-11: read authoritative portfolio table) ──
+def get_portfolio_capital():
+    """Read the canonical capital from the portfolio table. Falls back to 10000.0
+    only if the table is missing or empty (cold-boot). This replaces the
+    hardcoded `10000 + sum(pnl)` recompute that was bypassing the source of truth."""
+    if not TRADES_DB.exists():
+        return 10000.0
+    try:
+        conn = _conn(TRADES_DB)
+        r = conn.execute("SELECT capital FROM portfolio ORDER BY id DESC LIMIT 1").fetchone()
+        conn.close()
+        if r:
+            return _f(r['capital'], 10000.0)
+    except Exception:
+        pass
+    return 10000.0
+
 # ── Trade data ─────────────────────────────────────────────────────────────
 def get_trades():
+    # FIX 2026-04-11: was returning 3-tuple in the cold-boot branch but 2-tuple
+    # in the normal branch — caller unpacks 2, would crash on cold boot. Fixed
+    # to return 2-tuple in both branches (capital comes from get_portfolio_capital).
     if not TRADES_DB.exists():
-        return [], [], 10000.0
+        return [], []
     conn     = _conn(TRADES_DB)
     open_t   = [dict(r) for r in conn.execute(
         "SELECT * FROM trades WHERE status='open' ORDER BY entry_time DESC")]
@@ -119,7 +172,19 @@ def get_trades():
     return open_t, closed_t
 
 def pnl_of(t):
-    return _f(t.get('pnl_usdt',0)) + _f(t.get('partial_pnl_usdt',0))
+    # FIX 2026-04-11 audit Phase 4-bis dashboard agent: was double-counting partial_pnl_usdt
+    # on closed trades. trade_manager.close_trade() at line 624-625 already writes
+    # pnl_usdt = remaining_pnl + partial_pnl, so the partial is already inside pnl_usdt
+    # for closed trades. Adding partial_pnl_usdt on top counts it twice — inflating
+    # capital, total P&L, drawdown, etc. For OPEN trades pnl_usdt is NULL and
+    # partial_pnl_usdt is the only realized portion (from Stage 1/Stage 2 fires that
+    # haven't yet been final-closed); reading partial_pnl_usdt directly is correct
+    # there. The dormant case in pure_trailing_mode (no Stage 1/2 ever fires) is
+    # safe either way.
+    status = (t.get('status') or '').lower()
+    if status == 'closed':
+        return _f(t.get('pnl_usdt', 0))
+    return _f(t.get('partial_pnl_usdt', 0))
 
 def wl_of(p):
     if p > 0.005:  return 'W'
@@ -155,24 +220,25 @@ def get_today_pnl(closed):
                      if str(t.get('exit_time','') or '').startswith(today)), 2)
 
 def get_unrealized_pnl(open_trades):
-    if not open_trades: return 0.0
-    total = 0.0
-    try:
-        conn = _apex_conn()
-        if conn:
-            for t in open_trades:
-                r = conn.execute(
-                    "SELECT close FROM ohlcv WHERE symbol=? AND timeframe=? ORDER BY timestamp DESC LIMIT 1",
-                    (t.get('symbol',''), t.get('timeframe',''))
-                ).fetchone()
-                if r:
-                    curr  = _f(r['close'])
-                    entry = _f(t.get('avg_entry_price', t.get('entry_price',0)))
-                    qty   = _f(t.get('quantity_remaining', t.get('quantity',0)))
-                    dirn  = t.get('direction','')
-                    total += (curr-entry)*qty if dirn=='long' else (entry-curr)*qty
-            conn.close()
-    except: pass
+    """FIX 2026-04-11: was reading the most recent OHLCV candle close from apex.db
+    (potentially hours stale on 1d timeframes). Now uses live ticker prices via
+    bot.data_feed.fetch_current_prices (cached 60s) — same source dashboard.py uses,
+    so the two dashboards stay consistent. Note: qty already includes leverage
+    (capital_manager.calculate_position_size), so do NOT multiply by leverage again."""
+    if not open_trades:
+        return 0.0
+    symbols = [t.get('symbol', '') for t in open_trades if t.get('symbol')]
+    prices  = get_live_prices(symbols)
+    total   = 0.0
+    for t in open_trades:
+        sym   = t.get('symbol', '')
+        entry = _f(t.get('avg_entry_price', t.get('entry_price', 0)))
+        qty   = _f(t.get('quantity_remaining', t.get('quantity', 0)))
+        dirn  = t.get('direction', '')
+        curr  = _f(prices.get(sym), entry)  # fallback to entry if no live price
+        if curr <= 0 or entry <= 0 or qty <= 0:
+            continue
+        total += (curr - entry) * qty if dirn == 'long' else (entry - curr) * qty
     return round(total, 2)
 
 # ── Equity curve ───────────────────────────────────────────────────────────
@@ -210,36 +276,60 @@ def build_breakdown(closed, strat_map):
     ], key=lambda x: x['net_pnl'], reverse=True)
 
 # ── Format rows ────────────────────────────────────────────────────────────
-def fmt_open(t, strat_map):
-    sym   = t.get('symbol','')
-    entry = _f(t.get('avg_entry_price', t.get('entry_price',0)))
-    bars  = int(_f(t.get('candles_open',0)))
-    curr  = entry
-    try:
-        conn = _apex_conn()
-        if conn:
-            r = conn.execute(
-                "SELECT close FROM ohlcv WHERE symbol=? AND timeframe=? ORDER BY timestamp DESC LIMIT 1",
-                (sym, t.get('timeframe',''))
-            ).fetchone()
-            if r: curr = _f(r['close'])
-            conn.close()
-    except: pass
-    dirn = t.get('direction','')
-    qty  = _f(t.get('quantity_remaining', t.get('quantity',0)))
-    pnl  = ((curr-entry)*qty if dirn=='long' else (entry-curr)*qty) if qty > 0 else 0.0
+# Timeframe → hours-per-candle map (for time-stop bars-left calc)
+_TF_HOURS = {'1h': 1, '4h': 4, '1d': 24}
+
+def fmt_open(t, strat_map, prices=None):
+    """FIX 2026-04-11 audit Phase 4-bis dashboard agent — three changes:
+       1. 'stop' now reads trailing_sl (the live SL the engine actually checks)
+          with fallback to stop_loss. Was always showing the original entry stop,
+          which under pure_trailing_mode will diverge once price reaches +1R.
+       2. 'left' now uses TIME_STOP_HOURS + wall-clock elapsed instead of the
+          hardcoded `30 - bars` heuristic that was wrong on 1d timeframes.
+       3. 'current' uses live prices passed in via the `prices` arg, not the
+          stale ohlcv close from apex.db.
+    """
+    sym   = t.get('symbol', '')
+    entry = _f(t.get('avg_entry_price', t.get('entry_price', 0)))
+    bars  = int(_f(t.get('candles_open', 0)))
+    dirn  = t.get('direction', '')
+    qty   = _f(t.get('quantity_remaining', t.get('quantity', 0)))
+    tf    = t.get('timeframe', '1h')
+
+    # Live current price (with fallback to entry)
+    curr = _f((prices or {}).get(sym), entry)
+
+    # Unrealized P&L (qty already includes leverage — do NOT multiply by lev)
+    pnl = ((curr - entry) * qty if dirn == 'long' else (entry - curr) * qty) if qty > 0 else 0.0
+
+    # Time-stop bars-left, computed from TIME_STOP_HOURS and entry wall-clock
+    total_hours = TIME_STOP_HOURS.get(tf, 30)
+    tf_h        = _TF_HOURS.get(tf, 1)
+    left = max(0, int(total_hours / tf_h) - bars)
+    entry_str = t.get('entry_time', '')
+    if entry_str:
+        try:
+            entry_dt  = datetime.fromisoformat(str(entry_str).replace('Z', '+00:00'))
+            elapsed_h = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 3600
+            left = max(0, int((total_hours - elapsed_h) / tf_h))
+        except Exception:
+            pass
+
+    # Live trailing stop (the SL the engine actually checks), fallback to original
+    live_stop = _f(t.get('trailing_sl'), _f(t.get('stop_loss', 0)))
+
     return {
         'coin':     _sym(sym),
         'side':     dirn,
-        'strategy': strat_map.get(sym,''),
-        'tf':       t.get('timeframe',''),
+        'strategy': strat_map.get(sym, ''),
+        'tf':       tf,
         'entry':    entry,
-        'stop':     _f(t.get('stop_loss',0)),
-        'current':  round(curr,4),
-        'pnl':      round(pnl,2),
+        'stop':     live_stop,
+        'current':  round(curr, 4),
+        'pnl':      round(pnl, 2),
         'bars':     bars,
-        'left':     max(0, 30 - bars),
-        'opened':   str(t.get('entry_time',''))[:16]
+        'left':     left,
+        'opened':   str(t.get('entry_time', ''))[:16]
     }
 
 def fmt_closed(t, strat_map):
@@ -262,15 +352,23 @@ def api_data():
     open_t, closed_t = get_trades()
     strat_map = get_strategy_map()
     s         = calc_stats(closed_t)
-    cap       = round(10000.0 + s['total_pnl'], 2)
-    eq_pts    = build_equity(closed_t)
-    peak      = max((p['y'] for p in eq_pts), default=10000.0)
-    dd        = round((peak-cap)/peak*100, 1) if peak > 0 else 0.0
+    # FIX 2026-04-11: read authoritative capital from portfolio table instead of
+    # hardcoded 10000+sum recompute. Also fixes the (now-dormant) double-count of
+    # partial_pnl_usdt that was inflating capital, drawdown, etc. on dashboard2.
+    cap       = round(get_portfolio_capital(), 2)
+    eq_pts    = build_equity(closed_t, init=10000.0)
+    peak      = max((p['y'] for p in eq_pts), default=cap)
+    peak      = max(peak, cap)  # peak should never be below current capital
+    dd        = round((peak - cap) / peak * 100, 1) if peak > 0 else 0.0
+
+    # Pre-fetch live prices once per request and pass into fmt_open + get_unrealized_pnl
+    open_symbols = [t.get('symbol', '') for t in open_t if t.get('symbol')]
+    live_prices  = get_live_prices(open_symbols)
 
     return jsonify({
         'status':         get_bot_status(),
         'capital':        cap,
-        'peak':           round(peak,2),
+        'peak':           round(peak, 2),
         'drawdown':       dd,
         'open_count':     len(open_t),
         'active_tokens':  get_active_tokens(),
@@ -279,8 +377,8 @@ def api_data():
         'stats':          s,
         'btc_fg':         get_btc_fg(),
         'filters':        get_filter_rejects(),
-        'open_trades':    [fmt_open(t,strat_map) for t in open_t],
-        'closed_trades':  [fmt_closed(t,strat_map) for t in closed_t[:20]],
+        'open_trades':    [fmt_open(t, strat_map, prices=live_prices) for t in open_t],
+        'closed_trades':  [fmt_closed(t, strat_map) for t in closed_t[:20]],
         'breakdown':      build_breakdown(closed_t, strat_map),
         'equity':         eq_pts,
         'updated':        datetime.now(timezone.utc).strftime('%H:%M:%S UTC')
