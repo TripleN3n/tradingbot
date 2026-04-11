@@ -423,6 +423,16 @@ def update_trailing_sl(
     current_price: float,
     current_atr: float,
 ) -> dict:
+    """
+    FIX 2026-04-11 audit Phase 4-bis: Added pure_trailing_mode support.
+    When TP["pure_trailing_mode"] is True, the ATR trail engages from the moment
+    breakeven is reached (instead of waiting for tier2_tp_hit which only fires
+    after Stage 2 partial close in the legacy 40/30/30 system). This implements
+    the "max gain via trailing" strategy validated by the Phase 4-bis backtest:
+    Option E doubled HBAR strategy count and added 62% more ETH strategies vs
+    the legacy 40/30/30 — and is compatible with check_primary_tp() being a
+    no-op under the same flag.
+    """
     trade_id     = trade["id"]
     direction    = trade["direction"]
     avg_entry    = trade["avg_entry_price"]
@@ -430,6 +440,8 @@ def update_trailing_sl(
     current_sl   = trade["trailing_sl"]
     at_breakeven = bool(trade["at_breakeven"])
     tp_hit       = bool(trade.get("tier2_tp_hit", 0))
+
+    pure_trailing = TP.get("pure_trailing_mode", False)
 
     new_sl = current_sl
     at_be  = at_breakeven
@@ -446,7 +458,12 @@ def update_trailing_sl(
             lock_sl = avg_entry + (sl_distance * TRAILING_SL["trail_lock"])
             new_sl  = max(new_sl, lock_sl)
 
-        if tp_hit and current_atr > 0:
+        # FIX 2026-04-11: ATR trail engages when tier2_tp_hit (legacy) OR when
+        # pure_trailing_mode is on AND we're at-or-past breakeven. The latter
+        # gives the entire position an ATR-based ratchet from the moment we
+        # cross 1R move, replacing the legacy "wait for Stage 2" gating.
+        engage_atr_trail = tp_hit or (pure_trailing and at_be)
+        if engage_atr_trail and current_atr > 0:
             atr_trail = current_price - (current_atr * TP["trail_atr_multiplier"])
             new_sl    = max(new_sl, atr_trail)
 
@@ -462,7 +479,9 @@ def update_trailing_sl(
             lock_sl = avg_entry - (sl_distance * TRAILING_SL["trail_lock"])
             new_sl  = min(new_sl, lock_sl)
 
-        if tp_hit and current_atr > 0:
+        # FIX 2026-04-11: same ATR-trail engagement logic as long branch
+        engage_atr_trail = tp_hit or (pure_trailing and at_be)
+        if engage_atr_trail and current_atr > 0:
             atr_trail = current_price + (current_atr * TP["trail_atr_multiplier"])
             new_sl    = min(new_sl, atr_trail)
 
@@ -483,6 +502,15 @@ def check_primary_tp(
     current_high: float,
     current_low: float,
 ) -> bool:
+    """
+    FIX 2026-04-11 audit Phase 4-bis: When TP["pure_trailing_mode"] is True,
+    skip Stage 1 / Stage 2 fixed TP closes entirely. The trailing SL handles
+    all profit-taking via update_trailing_sl(). This is the live counterpart
+    to the backtest Variant E that won the Phase 4-bis comparison.
+    """
+    if TP.get("pure_trailing_mode", False):
+        return False
+
     trade_id      = trade["id"]
     direction     = trade["direction"]
     avg_entry     = trade["avg_entry_price"]

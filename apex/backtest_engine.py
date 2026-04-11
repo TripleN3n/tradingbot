@@ -276,10 +276,19 @@ def calc_sl_tp(sigs, i, direction, rrr):
 
 def simulate(sigs, idx, direction, entry, sl, tp_unused, sl_dist, tf):
     """
-    Tiered exit:
-    - 40% at 1.5× RRR
-    - 30% at 2.0× RRR
-    - 30% trailing with 1.5× ATR
+    Exit logic — supports both legacy tiered exit and pure_trailing_mode (2026-04-11).
+
+    Legacy (TP["pure_trailing_mode"] = False):
+      - 40% at 1.5× RRR (Stage 1)
+      - 30% at 2.0× RRR (Stage 2)
+      - 30% trailing with `trail_atr_multiplier` × ATR after Stage 2
+
+    Pure trailing (TP["pure_trailing_mode"] = True):
+      - No fixed-target closes
+      - At +1R move: SL → breakeven
+      - At-and-after breakeven: ATR trail (`trail_atr_multiplier` × ATR) on entire position
+      - Validated by Phase 4-bis backtest: Option E doubled HBAR strategy count
+        and added 62% more ETH strategies vs legacy 40/30/30
     """
     ts      = TIME_STOP_CANDLES.get(tf, 24)
     n       = len(sigs["close"])
@@ -289,6 +298,7 @@ def simulate(sigs, idx, direction, entry, sl, tp_unused, sl_dist, tf):
     rem     = 1.0; total = 0.0
     t1_done = False; t2_done = False
 
+    pure_trailing = TP.get("pure_trailing_mode", False)
     t1_pct  = TP.get("tier1_close_pct", 0.40)
     t2_pct  = TP.get("tier2_close_pct", 0.30)
     at_mult = TP.get("trail_atr_multiplier", 1.5)
@@ -311,13 +321,17 @@ def simulate(sigs, idx, direction, entry, sl, tp_unused, sl_dist, tf):
                 return {"pnl_pct": total, "exit_reason": "stop_loss", "win": total > 0}
             if pd_ >= be and csl < entry: csl = entry
             if pd_ >= tr_lock: csl = max(csl, entry + sl_dist * TRAILING_SL["trail_lock"])
-            if not t1_done and hi >= tp1:
-                total += (tp1-entry)/entry * t1_pct; rem -= t1_pct
-                t1_done = True; csl = max(csl, entry)
-            if t1_done and not t2_done and hi >= tp2:
-                total += (tp2-entry)/entry * t2_pct; rem -= t2_pct
-                t2_done = True; csl = max(csl, tp1)
-            if t2_done and not np.isnan(at):
+            # Legacy fixed-TP closes — skipped entirely in pure_trailing_mode
+            if not pure_trailing:
+                if not t1_done and hi >= tp1:
+                    total += (tp1-entry)/entry * t1_pct; rem -= t1_pct
+                    t1_done = True; csl = max(csl, entry)
+                if t1_done and not t2_done and hi >= tp2:
+                    total += (tp2-entry)/entry * t2_pct; rem -= t2_pct
+                    t2_done = True; csl = max(csl, tp1)
+            # ATR trail — engages on tier2_done (legacy) OR breakeven-reached (pure_trailing)
+            engage_trail = t2_done or (pure_trailing and pd_ >= be)
+            if engage_trail and not np.isnan(at):
                 csl = max(csl, cl - at * at_mult)
         else:
             pd_ = entry - cl
@@ -326,13 +340,15 @@ def simulate(sigs, idx, direction, entry, sl, tp_unused, sl_dist, tf):
                 return {"pnl_pct": total, "exit_reason": "stop_loss", "win": total > 0}
             if pd_ >= be and csl > entry: csl = entry
             if pd_ >= tr_lock: csl = min(csl, entry - sl_dist * TRAILING_SL["trail_lock"])
-            if not t1_done and lo <= tp1:
-                total += (entry-tp1)/entry * t1_pct; rem -= t1_pct
-                t1_done = True; csl = min(csl, entry)
-            if t1_done and not t2_done and lo <= tp2:
-                total += (entry-tp2)/entry * t2_pct; rem -= t2_pct
-                t2_done = True; csl = min(csl, tp1)
-            if t2_done and not np.isnan(at):
+            if not pure_trailing:
+                if not t1_done and lo <= tp1:
+                    total += (entry-tp1)/entry * t1_pct; rem -= t1_pct
+                    t1_done = True; csl = min(csl, entry)
+                if t1_done and not t2_done and lo <= tp2:
+                    total += (entry-tp2)/entry * t2_pct; rem -= t2_pct
+                    t2_done = True; csl = min(csl, tp1)
+            engage_trail = t2_done or (pure_trailing and pd_ >= be)
+            if engage_trail and not np.isnan(at):
                 csl = min(csl, cl + at * at_mult)
 
     ep    = sigs["close"][min(idx+ts, n-1)]
@@ -565,10 +581,28 @@ def passes_thresholds(m):
 
 
 def check_overfitting(tm, vm):
-    if tm["expectancy"] > 0:
-        gap = abs(tm["expectancy"] - vm["expectancy"]) / tm["expectancy"]
-    else:
-        gap = 1.0
+    """
+    FIX 2026-04-11 audit Phase 4: Only penalize true overfitting — i.e. validation
+    UNDERPERFORMING training. The old code used abs(train - val) / train which is
+    symmetric and rejected strategies where validation OUTPERFORMED training (a
+    positive surprise, not overfitting). It also defaulted to gap=1.0 when train
+    expectancy was non-positive, rejecting any strategy with weak training expectancy
+    even when validation was strong. Both branches are now corrected:
+      - Validation outperforming training → gap = 0 (PASS)
+      - Validation underperforming training → gap = (train - val) / train (proportional)
+      - Train expectancy non-positive → gap = 0 (defer judgment to passes_thresholds)
+    """
+    train_exp = tm["expectancy"]
+    val_exp   = vm["expectancy"]
+
+    # If train didn't produce positive expectancy, we can't meaningfully measure
+    # overfitting. Defer to passes_thresholds() to reject this on its own merits.
+    if train_exp <= 0:
+        return True, 0.0
+
+    # Only the case where val < train counts as overfitting (true degradation).
+    underperformance = max(0.0, train_exp - val_exp)
+    gap = underperformance / max(train_exp, 1e-9)
     return gap <= BACKTEST["max_overfitting_gap"], gap
 
 
@@ -711,7 +745,12 @@ def run_backtest_for_token(conn, symbol):
     min_1h = min_t.get("1h", 10) if isinstance(min_t, dict) else 10
     min_4h = min_t.get("4h", 5)  if isinstance(min_t, dict) else 5
     min_1d = min_t.get("1d", 3)  if isinstance(min_t, dict) else 3
-    min_v  = 3
+    # FIX 2026-04-11 audit Phase 4-bis: bumped from 3 → 10. The old value let
+    # tiny-sample (e.g. 7-trade) strategies into all_results, where they
+    # produced statistically meaningless top results like single_tf 4h
+    # WR 85.7% PF 31.71 Sharpe 22.67 — coin-toss noise on 7 trades. 10 is
+    # still permissive but rejects the most egregious overfit-suspect cases.
+    min_v  = 10
 
     all_results = []
 

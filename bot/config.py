@@ -202,12 +202,25 @@ TRAILING_SL = {
 }
 
 TP = {
+    # FIX 2026-04-11 audit Phase 4-bis: Pure trailing TP mode enabled.
+    # Validated by Phase 4-bis backtest "Variant E" — Option E was the only
+    # variant that beat Current on BOTH HBAR and ETH. HBAR strategies 2->4
+    # (+100%), ETH strategies 8->13 (+62%), HBAR best WR 40%->53%.
+    # When pure_trailing_mode is True:
+    #   - Stage 1 / Stage 2 fixed TP closes are SKIPPED (check_primary_tp returns False)
+    #   - The ATR trail engages from the moment +1R move is reached (breakeven)
+    #   - The entire position rides the ATR trail until it ratchets back into a stop
+    # The tier1_*/tier2_* config values below are kept for backwards compat but
+    # are NOT read when pure_trailing_mode is True. To revert to legacy 40/30/30,
+    # flip pure_trailing_mode back to False.
+    "pure_trailing_mode":   True,
+    "trail_atr_multiplier": 1.0,    # Was 1.5; tightened for max gain via trailing
+    # Legacy keys (only read when pure_trailing_mode=False)
     "tier1_close_pct":      0.40,
     "tier1_rrr":            1.5,
     "tier2_close_pct":      0.30,
     "tier2_rrr":            2.0,
     "trail_pct":            0.30,
-    "trail_atr_multiplier": 1.5,
 }
 
 ENTRY = {
