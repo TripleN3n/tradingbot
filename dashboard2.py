@@ -4,7 +4,7 @@ APEX Dashboard v2 — Premium Trading Dashboard
 Flask + Vanilla JS | Port 8502
 """
 
-import sqlite3, json, os, re, glob, logging, time, sys
+import sqlite3, json, os, re, glob, logging, time, sys, math
 from flask import Flask, jsonify, Response
 from datetime import datetime, timezone
 from pathlib import Path
@@ -196,7 +196,8 @@ def calc_stats(closed):
     pnls = [pnl_of(t) for t in closed]
     if not pnls:
         return dict(total=0,wins=0,losses=0,neutral=0,wr=0.0,exp=0.0,
-                    pf=0.0,avg_win=0.0,avg_loss=0.0,best=0.0,worst=0.0,total_pnl=0.0)
+                    pf=0.0,avg_win=0.0,avg_loss=0.0,best=0.0,worst=0.0,total_pnl=0.0,
+                    max_win_streak=0,max_loss_streak=0)
     wins   = [p for p in pnls if p >  0.005]
     losses = [p for p in pnls if p < -0.005]
     neut   = len(pnls) - len(wins) - len(losses)
@@ -205,13 +206,31 @@ def calc_stats(closed):
     al     = sum(losses)/len(losses) if losses else 0.0
     gp     = sum(wins)
     gl     = abs(sum(losses))
+
+    # FIX 2026-04-11 (user feedback round 2): compute Max Win Streak and Max
+    # Loss Streak. closed comes from get_trades sorted by exit_time DESC, so we
+    # reverse to chronological order (oldest first). Neutral trades (|pnl|<0.005)
+    # are ignored — they neither extend nor break a streak.
+    closed_chrono = sorted(closed, key=lambda t: t.get('exit_time', '') or '')
+    max_w_streak = max_l_streak = cur_w = cur_l = 0
+    for t in closed_chrono:
+        p = pnl_of(t)
+        if p > 0.005:
+            cur_w += 1; cur_l = 0
+            if cur_w > max_w_streak: max_w_streak = cur_w
+        elif p < -0.005:
+            cur_l += 1; cur_w = 0
+            if cur_l > max_l_streak: max_l_streak = cur_l
+
     return dict(
         total=len(pnls), wins=len(wins), losses=len(losses), neutral=neut,
         wr=round(wr,1), exp=round((wr/100)*aw+(1-wr/100)*al,2),
         pf=round(gp/gl if gl else 0,2),
         avg_win=round(aw,2), avg_loss=round(al,2),
         best=round(max(pnls),2), worst=round(min(pnls),2),
-        total_pnl=round(sum(pnls),2)
+        total_pnl=round(sum(pnls),2),
+        max_win_streak=max_w_streak,
+        max_loss_streak=max_l_streak,
     )
 
 def get_today_pnl(closed):
@@ -303,23 +322,30 @@ def fmt_open(t, strat_map, prices=None):
     # Unrealized P&L (qty already includes leverage — do NOT multiply by lev)
     pnl = ((curr - entry) * qty if dirn == 'long' else (entry - curr) * qty) if qty > 0 else 0.0
 
-    # BARS + LEFT — both computed from wall-clock elapsed time. The DB's
-    # candles_open field is unreliable: it has legacy stale values (HBAR shows
-    # 62 because the pre-v3.8.1 cycle counter was incrementing every hour, not
-    # every candle close) AND a +1 spurious increment every time the bot
-    # restarts (because last_candle_ts="" on first observation triggers +1).
-    # Wall-clock elapsed is the source of truth.
+    # BARS + LEFT — wall-clock based. The DB's candles_open field is unreliable
+    # (legacy stale values from pre-v3.8.1 cycle counter + spurious +1 per restart).
+    #
+    # FIX 2026-04-11 round 2 (user feedback): the previous floor/floor formula
+    # lost 1 candle to truncation in both directions, so bars+left=9 for a
+    # 10-candle time-stop period (1d). New formula:
+    #   bars = ceil(elapsed_h / tf_h)   — entry candle counts as "touched"
+    #   left = floor((total_h - elapsed_h) / tf_h) — full guaranteed remaining
+    #   bars + left = total_candles (always)
+    # For 1d: NEO/LINK/CFX (opened today) → bars=1, left=9, sum=10. HBAR
+    # (opened ~59h ago) → bars=ceil(2.48)=3, left=floor(7.52)=7, sum=10.
     total_hours = TIME_STOP_HOURS.get(tf, 30)
     tf_h        = _TF_HOURS.get(tf, 1)
+    total_candles = max(1, int(total_hours / tf_h))
     bars = 0
-    left = max(0, int(total_hours / tf_h))
+    left = total_candles
     entry_str = t.get('entry_time', '')
     if entry_str:
         try:
             entry_dt  = datetime.fromisoformat(str(entry_str).replace('Z', '+00:00'))
             elapsed_h = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 3600
-            bars = max(0, int(elapsed_h / tf_h))
-            left = max(0, int((total_hours - elapsed_h) / tf_h))
+            if elapsed_h > 0:
+                bars = max(1, math.ceil(elapsed_h / tf_h))
+                left = max(0, int((total_hours - elapsed_h) / tf_h))
         except Exception:
             pass
 
@@ -448,9 +474,10 @@ body{background:var(--bg);color:var(--t1);font-family:var(--ui);font-size:14px;m
 .fg-greed{color:var(--green);}
 .updated{font-size:9px;color:var(--t3);}
 
-/* KPI rows */
-.kpi-row1{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px;}
-.kpi-row2{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px;}
+/* KPI rows — FIX 2026-04-11 user feedback round 2: 5 cards per row, 2 rows
+   = 10 cards total. Row 1 = current state, Row 2 = historical performance. */
+.kpi-row1{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:10px;}
+.kpi-row2{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px;}
 .mc{background:var(--bg2);border:1px solid var(--bd);border-radius:10px;padding:14px 16px;position:relative;overflow:hidden;}
 .mc::after{content:'';position:absolute;top:0;left:0;right:0;height:2px;border-radius:10px 10px 0 0;}
 .mc-teal::after{background:var(--teal);}
@@ -537,7 +564,8 @@ td{padding:8px 12px 8px 0;border-top:1px solid var(--bd);color:var(--t2);white-s
 
 .footer{text-align:center;color:var(--t3);font-size:10px;padding:20px 0 8px;letter-spacing:.04em;}
 
-@media(max-width:1100px){.kpi-row1{grid-template-columns:repeat(2,1fr);}.kpi-row2{grid-template-columns:repeat(3,1fr);}}
+@media(max-width:1300px){.kpi-row1,.kpi-row2{grid-template-columns:repeat(3,1fr);}}
+@media(max-width:900px){.kpi-row1,.kpi-row2{grid-template-columns:repeat(2,1fr);}}
 @media(max-width:768px){
   .kpi-row1,.kpi-row2{grid-template-columns:repeat(2,1fr);}
   .two-col{grid-template-columns:1fr;}
@@ -567,7 +595,7 @@ td{padding:8px 12px 8px 0;border-top:1px solid var(--bd);color:var(--t2);white-s
   </div>
 </div>
 
-<!-- KPI Row 1 -->
+<!-- KPI Row 1 — Current State -->
 <div class="kpi-row1">
   <div class="mc mc-teal">
     <div class="mc-lbl">Capital</div>
@@ -580,23 +608,9 @@ td{padding:8px 12px 8px 0;border-top:1px solid var(--bd);color:var(--t2);white-s
     <div class="mc-sub" id="mOpenSub">—</div>
   </div>
   <div class="mc mc-amber">
-    <div class="mc-lbl">Win Rate</div>
-    <div class="mc-val" id="mWR">—</div>
-    <div class="mc-sub" id="mWRSub">—</div>
-  </div>
-  <div class="mc mc-red">
-    <div class="mc-lbl">Drawdown</div>
-    <div class="mc-val" id="mDD">—</div>
-    <div class="mc-sub" id="mDDSub">—</div>
-  </div>
-</div>
-
-<!-- KPI Row 2 -->
-<div class="kpi-row2">
-  <div class="mc mc-green">
-    <div class="mc-lbl">Total P&amp;L</div>
-    <div class="mc-val" id="mTotalPnl">—</div>
-    <div class="mc-sub" id="mTotalSub">—</div>
+    <div class="mc-lbl">Strategies</div>
+    <div class="mc-val" id="mStrategies">—</div>
+    <div class="mc-sub" id="mStrategiesSub">active tokens</div>
   </div>
   <div class="mc mc-purple">
     <div class="mc-lbl">Today's P&amp;L</div>
@@ -607,6 +621,35 @@ td{padding:8px 12px 8px 0;border-top:1px solid var(--bd);color:var(--t2);white-s
     <div class="mc-lbl">Unrealized P&amp;L</div>
     <div class="mc-val" id="mUnreal">—</div>
     <div class="mc-sub" id="mUnrealSub">—</div>
+  </div>
+</div>
+
+<!-- KPI Row 2 — Historical Performance -->
+<div class="kpi-row2">
+  <div class="mc mc-green">
+    <div class="mc-lbl">Total P&amp;L</div>
+    <div class="mc-val" id="mTotalPnl">—</div>
+    <div class="mc-sub" id="mTotalSub">—</div>
+  </div>
+  <div class="mc mc-amber">
+    <div class="mc-lbl">Win Rate</div>
+    <div class="mc-val" id="mWR">—</div>
+    <div class="mc-sub" id="mWRSub">—</div>
+  </div>
+  <div class="mc mc-red">
+    <div class="mc-lbl">Drawdown</div>
+    <div class="mc-val" id="mDD">—</div>
+    <div class="mc-sub" id="mDDSub">—</div>
+  </div>
+  <div class="mc mc-teal">
+    <div class="mc-lbl">Max Win Streak</div>
+    <div class="mc-val" id="mWinStreak">—</div>
+    <div class="mc-sub" id="mWinStreakSub">consecutive wins</div>
+  </div>
+  <div class="mc mc-red">
+    <div class="mc-lbl">Max Loss Streak</div>
+    <div class="mc-val" id="mLossStreak">—</div>
+    <div class="mc-sub" id="mLossStreakSub">consecutive losses</div>
   </div>
 </div>
 
@@ -940,11 +983,24 @@ function render(d) {
   $('mCapSub').innerHTML=`<span class="${diff>=0?'up':'dn'}">${diff>=0?'▲':'▼'} \$${Math.abs(diff).toFixed(2)} (${pct}%)</span> from start`;
 
   $('mOpen').textContent=d.open_count;
-  $('mOpenSub').textContent=d.open_count?d.open_count+' active · '+d.active_tokens+' scanning':d.active_tokens+' tokens scanning';
+  $('mOpenSub').textContent=d.open_count?d.open_count+' active position'+(d.open_count>1?'s':''):'No open positions';
+
+  // FIX 2026-04-11 user feedback round 2: new Strategies card
+  $('mStrategies').textContent=d.active_tokens||0;
+  $('mStrategiesSub').textContent=(d.active_tokens||0)+' tokens scanning';
 
   $('mWR').textContent=d.stats.wr+'%';
   $('mWR').style.color=d.stats.wr>=50?'var(--teal)':'var(--amber)';
   $('mWRSub').textContent=d.stats.wins+'W  '+d.stats.losses+'L  '+d.stats.neutral+'N  of  '+d.stats.total;
+
+  // FIX 2026-04-11 user feedback round 2: Max Win/Loss Streak cards
+  const ws=d.stats.max_win_streak||0;
+  $('mWinStreak').textContent=ws;
+  $('mWinStreak').style.color=ws>=5?'var(--teal)':ws>=3?'var(--green)':'var(--t1)';
+
+  const ls=d.stats.max_loss_streak||0;
+  $('mLossStreak').textContent=ls;
+  $('mLossStreak').style.color=ls>=5?'var(--red)':ls>=3?'var(--amber)':'var(--t1)';
 
   $('mDD').textContent=d.drawdown+'%';
   $('mDD').style.color=d.drawdown>20?'var(--red)':d.drawdown>10?'var(--amber)':'var(--t1)';
