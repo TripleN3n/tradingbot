@@ -1,5 +1,5 @@
 # =============================================================================
-# APEX — Auto-Trading AI Agent
+# Auto-Trading AI Agent
 # requirements.txt — Python Dependencies
 # =============================================================================
 # Install on server with:
@@ -22,9 +22,10 @@ requests==2.31.0
 # Scheduling
 APScheduler==3.10.4
 
-# Dashboard
+# Dashboard (Streamlit legacy + Flask dashboard2)
 streamlit==1.29.0
 plotly==5.18.0
+flask>=3.0
 
 # Database
 # sqlite3 is built into Python — no install needed

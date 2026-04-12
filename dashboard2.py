@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-APEX Dashboard v2 — Premium Trading Dashboard
-Flask + Vanilla JS | Port 8502
+Dashboard v2 — Premium Trading Dashboard
+Flask + Vanilla JS | Indigo Aurora theme
+Port is configurable via DASHBOARD_PORT env var (default 8502).
 """
 
 import sqlite3, json, os, re, glob, logging, time, sys, math
@@ -10,18 +11,21 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import defaultdict
 
-# FIX 2026-04-11 audit Phase 4-bis dashboards: import bot.* modules so we can use
-# the canonical TIME_STOP_HOURS, fetch_current_prices, etc. instead of hardcoding.
-sys.path.insert(0, '/home/opc/tradingbot')
+# Derive BASE from this file's location so the dashboard works in any
+# clone directory (APEX at /home/opc/tradingbot, NAVIK at /home/opc/navikbot, etc.)
+BASE = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE))
 try:
     from bot.trade_manager import TIME_STOP_HOURS
 except Exception:
     TIME_STOP_HOURS = {"1h": 30, "4h": 120, "1d": 240}  # safe fallback
 
+# Port is configurable via env var for multi-instance deployments.
+DASHBOARD_PORT = int(os.environ.get('DASHBOARD_PORT', 8502))
+
 logging.basicConfig(level=logging.WARNING)
 app = Flask(__name__)
 
-BASE       = Path('/home/opc/tradingbot')
 TRADES_DB  = BASE / 'data' / 'trades.db'
 APEX_DBS   = [BASE / 'data' / 'apex.db', BASE / 'apex.db']
 BOT_LOG    = BASE / 'logs' / 'bot.log'
@@ -1901,4 +1905,4 @@ setInterval(load,30000);
 </html>"""
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8502, debug=False)
+    app.run(host='0.0.0.0', port=DASHBOARD_PORT, debug=False)
