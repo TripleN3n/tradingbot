@@ -102,8 +102,15 @@ kill_duplicates() {
 # ----------------------------------------------------------------
 # Check bot — must be canonical "python3 -m bot.main"
 # ----------------------------------------------------------------
-BOT_PIDS=$(pgrep -f "python3 -m bot\.main")
-BOT_COUNT=$(echo "$BOT_PIDS" | grep -c .)
+# Phase NAVIK coexistence: filter by cwd so each watchdog only manages its own bot
+BOT_PIDS=""
+for _pid in $(pgrep -f "python3 -m bot\.main"); do
+    _cwd=$(readlink /proc/$_pid/cwd 2>/dev/null)
+    [ "$_cwd" = "$DIR" ] && BOT_PIDS="$BOT_PIDS $_pid"
+done
+BOT_PIDS=$(echo "$BOT_PIDS" | xargs)
+BOT_COUNT=$(echo "$BOT_PIDS" | wc -w)
+[ -z "$BOT_PIDS" ] && BOT_COUNT=0
 
 if [ "$BOT_COUNT" -eq 0 ]; then
     if can_restart_bot; then
